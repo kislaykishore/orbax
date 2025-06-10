@@ -55,7 +55,7 @@ STORE_ARRAY_DATA_EQUAL_TO_FILL_VALUE = True
 
 
 _BASE_TS_CONTEXT = {
-    'file_io_concurrency': {'limit': 128},
+    'file_io_concurrency': {'limit': int(os.environ['FILE_IO_CONCURRENCY']) if 'FILE_IO_CONCURRENCY' in os.environ else 128 },
 }
 _DEFAULT_OCDBT_TS_CONTEXT = {
     **_BASE_TS_CONTEXT,
