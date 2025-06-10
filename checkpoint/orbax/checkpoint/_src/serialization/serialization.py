@@ -36,8 +36,7 @@ from orbax.checkpoint._src.serialization import replica_slices
 from orbax.checkpoint._src.serialization import tensorstore_utils as ts_utils
 import tensorstore as ts
 
-
-TS_CONTEXT = ts.Context({'file_io_concurrency': {'limit': 128}})
+TS_CONTEXT = ts.Context({'file_io_concurrency': {'limit': int(os.environ['FILE_IO_CONCURRENCY']) if 'FILE_IO_CONCURRENCY' in os.environ else 128}})
 _REMOVED_VALUE = 'Value removed'
 _CHECKPOINT_SUCCESS = 'checkpoint_write_success'
 
