@@ -20,6 +20,7 @@ paths, which allow other implementations.
 
 from __future__ import annotations
 
+import typing
 from typing import Optional, Protocol
 
 from etils import epath
@@ -30,6 +31,7 @@ from orbax.checkpoint._src.metadata import checkpoint as checkpoint_metadata
 
 # TODO(b/326119183) Support configuration of temporary path detection
 # (currently handled by `tmp_checkpoints` util methods).
+@typing.runtime_checkable
 class TemporaryPath(Protocol):
   """Class that represents a temporary path.
 
@@ -37,8 +39,9 @@ class TemporaryPath(Protocol):
   is primarily constructed from this path. The class contains logic to create
   the temporary path, and to finalize it into the final path.
 
-  NOTE: All methods are intended to be called across all active processes,
-  except for `finalize`, which is only called on the primary host.
+  `from_final` should be called from all hosts to construct the temporary path
+  instance from the given final path.
+  `create` and `finalize` must be called only on the primary host.
   """
 
   @classmethod
@@ -50,9 +53,6 @@ class TemporaryPath(Protocol):
           checkpoint_metadata.MetadataStore
       ] = None,
       file_options: Optional[options_lib.FileOptions] = None,
-      multiprocessing_options: Optional[
-          options_lib.MultiprocessingOptions
-      ] = None,
   ) -> TemporaryPath:
     """Creates a TemporaryPath from a final path."""
     ...
@@ -70,12 +70,14 @@ class TemporaryPath(Protocol):
     """Returns the final path without creating it."""
     ...
 
-  async def create(
-      self,
-      *,
-      file_options: options_lib.FileOptions = options_lib.FileOptions(),
-  ) -> epath.Path:
-    """Creates the temporary path on disk."""
+  async def create(self) -> epath.Path:
+    """Creates the temporary path on disk.
+
+    NOTE: This method should be only called on the primary host.
+
+    Returns:
+      The created temporary path.
+    """
     ...
 
   def finalize(
@@ -83,9 +85,7 @@ class TemporaryPath(Protocol):
   ):
     """Finalizes the temporary path into the final path.
 
-    NOTE: This method is only called on the primary host. This is in contrast
-    with all other methods in this class, which are called across all active
-    processes.
+    NOTE: This method should be only called on the primary host.
 
     This function is called from a background thread.
 

@@ -157,7 +157,6 @@ class Checkpointer(
     tmpdir = temporary_path_class.from_final(
         directory,
         checkpoint_metadata_store=self._metadata_store,
-        multiprocessing_options=self._multiprocessing_options,
         file_options=self._file_options,
     )
     return tmpdir
@@ -171,7 +170,7 @@ class Checkpointer(
     )
 
   def synchronize_next_awaitable_signal_operation_id(self):
-    synchronization.HandlerAwaitableSignalOperationIdGenerator.next_operation_id()
+    synchronization.OperationIdGenerator.next_operation_id()
 
     multihost.sync_global_processes(
         multihost.unique_barrier_key(
@@ -185,7 +184,7 @@ class Checkpointer(
         1,
         '[process=%s] Synchronized next awaitable signal operation id to %s',
         multihost.process_index(),
-        synchronization.HandlerAwaitableSignalOperationIdGenerator.get_current_operation_id(),
+        synchronization.OperationIdGenerator.get_current_operation_id(),
     )
 
   def save(

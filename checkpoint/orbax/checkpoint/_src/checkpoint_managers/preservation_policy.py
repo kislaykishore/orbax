@@ -17,6 +17,7 @@
 import dataclasses
 import datetime
 from typing import Any, Callable, Dict, Protocol, Sequence, Set
+from absl import logging
 import numpy as np
 from orbax.checkpoint._src.checkpoint_managers import policy_checkpoint_info
 
@@ -45,6 +46,47 @@ class PreservationPolicy(Protocol):
     ...
 
 
+def _log_preservation_decision(
+    policy_name: str,
+    checkpoints: Sequence[PolicyCheckpointInfo],
+    should_preserve_list: Sequence[bool],
+):
+  """Logs preservation decisions."""
+  if logging.vlog_is_on(1):
+    for i, checkpoint in enumerate(checkpoints):
+      if should_preserve_list[i]:
+        logging.vlog(
+            1,
+            f" {policy_name}: Preserving checkpoint at step"
+            f" {checkpoint.step}).",
+        )
+      else:
+        logging.vlog(
+            1,
+            f" {policy_name}: Not preserving checkpoint at step"
+            f" {checkpoint.step}).",
+        )
+
+
+@dataclasses.dataclass
+class PreserveAll(PreservationPolicy):
+  """Preserves all checkpoints."""
+
+  def should_preserve(
+      self,
+      checkpoints: Sequence[PolicyCheckpointInfo],
+      *,
+      context: PreservationContext,
+  ) -> Sequence[bool]:
+    result = [True] * len(checkpoints)
+    _log_preservation_decision(
+        "PreserveAll",
+        checkpoints,
+        result
+    )
+    return result
+
+
 @dataclasses.dataclass
 class LatestN(PreservationPolicy):
   """Preserves the last n checkpoints. Preserves all checkpoint if n is None."""
@@ -58,8 +100,15 @@ class LatestN(PreservationPolicy):
       context: PreservationContext,
   ) -> Sequence[bool]:
     if self.n is None or len(checkpoints) <= self.n:
-      return [True] * len(checkpoints)
-    return [False] * (len(checkpoints) - self.n) + [True] * self.n
+      result = [True] * len(checkpoints)
+    else:
+      result = [False] * (len(checkpoints) - self.n) + [True] * self.n
+    _log_preservation_decision(
+        f"LatestN (n={self.n})",
+        checkpoints,
+        result
+    )
+    return result
 
 
 @dataclasses.dataclass
@@ -86,6 +135,11 @@ class EveryNSeconds(PreservationPolicy):
         result.append(True)
       else:
         result.append(False)
+    _log_preservation_decision(
+        f"EveryNSeconds (interval_secs={self.interval_secs})",
+        checkpoints,
+        result
+    )
     return result
 
 
@@ -102,8 +156,14 @@ class EveryNSteps(PreservationPolicy):
       context: PreservationContext,
   ) -> Sequence[bool]:
     if self.interval_steps == 0:
-      raise ValueError('interval_steps must not be 0.')
-    return [ckpt.step % self.interval_steps == 0 for ckpt in checkpoints]
+      raise ValueError("interval_steps must not be 0.")
+    result = [ckpt.step % self.interval_steps == 0 for ckpt in checkpoints]
+    _log_preservation_decision(
+        f"EveryNSteps (interval_steps={self.interval_steps})",
+        checkpoints,
+        result
+    )
+    return result
 
 
 @dataclasses.dataclass
@@ -123,7 +183,13 @@ class CustomSteps(PreservationPolicy):
       *,
       context: PreservationContext,
   ) -> Sequence[bool]:
-    return [ckpt.step in self._steps_set for ckpt in checkpoints]
+    result = [ckpt.step in self._steps_set for ckpt in checkpoints]
+    _log_preservation_decision(
+        f"CustomSteps (steps={self._steps_set})",
+        checkpoints,
+        result
+    )
+    return result
 
 
 @dataclasses.dataclass
@@ -138,6 +204,9 @@ class AnyPreservationPolicy(PreservationPolicy):
       *,
       context: PreservationContext,
   ) -> Sequence[bool]:
+    logging.vlog(
+        1, "AnyPreservationPolicy: Preserving if any child policy preserves."
+    )
     should_preserve_by_policy = np.asarray([
         policy.should_preserve(checkpoints, context=context)
         for policy in self.policies
@@ -147,11 +216,24 @@ class AnyPreservationPolicy(PreservationPolicy):
 
 @dataclasses.dataclass(kw_only=True)
 class BestN(PreservationPolicy):
-  """A policy that preserves the best checkpoints based on a get_metric_fn."""
+  """A policy that preserves the best checkpoints based on a best_fn.
+
+  get_metric_fn:
+    A function that accepts a nested tree of metrics and returns a scalar value
+    representing the value used for ranking checkpoints.
+  reverse:
+    If False (default), checkpoints are sorted in ascending order, according to
+    the best_fn. If True, checkpoints are sorted in descending order. Same as
+    the semantics of built-in sorted() function.
+  n:
+    The number of checkpoints to preserve. If None, all checkpoints are
+    preserved. If 0, no checkpoints are preserved.
+  """
 
   get_metric_fn: Callable[[PyTree], float]
-  reverse: bool
+  reverse: bool = False
   n: int | None = None
+  keep_checkpoints_without_metrics: bool = True
 
   def should_preserve(
       self,
@@ -179,12 +261,17 @@ class BestN(PreservationPolicy):
         reverse=self.reverse,
     )
     preserve_indices = [
-        item[0]
-        for item in indexed_checkpoints_with_metrics[-self.n :]
-        + indexed_checkpoints_without_metrics
+        i for i, _ in indexed_checkpoints_with_metrics[-self.n :]
     ]
+    if self.keep_checkpoints_without_metrics:
+      preserve_indices += [i for i, _ in indexed_checkpoints_without_metrics]
     preserve_indices_set = set(preserve_indices)
     preserve_flags = [
         i in preserve_indices_set for i in range(len(checkpoints))
     ]
+    _log_preservation_decision(
+        f"BestN (n={self.n})",
+        checkpoints,
+        preserve_flags
+    )
     return preserve_flags

@@ -41,6 +41,9 @@ class JaxModule(orbax_module_base.OrbaxModuleBase):
       apply_fn: Union[ApplyFn, Mapping[str, ApplyFn]],
       trainable: Optional[Union[bool, PyTree]] = None,
       input_polymorphic_shape: Union[PyTree, Mapping[str, PyTree], None] = None,
+      input_polymorphic_shape_symbol_values: Union[
+          PyTree, Mapping[str, PyTree], None
+      ] = None,
       jax2tf_kwargs: Optional[Mapping[str, Any]] = None,
       jit_compile: Union[bool, Mapping[str, bool]] = True,
       pspecs: Optional[PyTree] = None,
@@ -68,6 +71,15 @@ class JaxModule(orbax_module_base.OrbaxModuleBase):
         ``apply_fn``. If ``apply_fn`` is a mapping, ``input_polymorphic_shape``
         must be a mapping of method key to the input polymorphic shape for the
         method.
+      input_polymorphic_shape_symbol_values: optional mapping of symbol names
+        presented in `input_polymorphic_shape` to possible values (e.g.
+        {'batch_size': (1, 2), 'seq_len': (128, 512)}). When there are multiple
+        ``apply_fn``s in the form of a flat mapping, this argument must be a
+        flat mapping with the same keys (e.g. { 'serving_default': {
+        'batch_size': (1, 2), 'seq_len': (128, 512)}). When this argument is
+        set, the polymoprhic shape will be concretized to a set of all possible
+        concreteized input shape combinations. This is only relevant for export
+        model type `constants.ExportModelType.ORBAX_MODEL`
       jax2tf_kwargs: options passed to jax2tf. ``polymorphic_shape`` is inferred
         from ``input_polymorphic_shape`` and should not be set.
         ``with_gradient``, if set, should be consistent with the ``trainable``
@@ -96,28 +108,47 @@ class JaxModule(orbax_module_base.OrbaxModuleBase):
       jax2obm_kwargs: options passed to the Orbax Model export. Accepted
         arguments are 'native_serialization_platforms' which must be a tuple of
         OrbaxNativeSerializationType.
+
+    raises:
+      ValueError: If the export version is not supported.
     """
     self._export_version = export_version
+    if (
+        input_polymorphic_shape_symbol_values is not None
+        and export_version != constants.ExportModelType.ORBAX_MODEL
+    ):
+      raise ValueError(
+          '`input_polymorphic_shape_symbol_values` is only supported for'
+          ' constants.ExportModelType.ORBAX_MODEL.'
+      )
 
-    if export_version == constants.ExportModelType.ORBAX_MODEL:
-      self._export_module = obm_module.ObmModule(
-          params=params,
-          apply_fn=apply_fn,
-          input_polymorphic_shape=input_polymorphic_shape,
-          jax2obm_kwargs=jax2obm_kwargs,
-      )
-    else:
-      self._export_module = tensorflow_module.TensorFlowModule(
-          params=params,
-          apply_fn=apply_fn,
-          trainable=trainable,
-          input_polymorphic_shape=input_polymorphic_shape,
-          jit_compile=jit_compile,
-          pspecs=pspecs,
-          allow_multi_axis_sharding_consolidation=allow_multi_axis_sharding_consolidation,
-          jax2tf_kwargs=jax2tf_kwargs,
-          export_version=export_version,
-      )
+    match export_version:
+      case constants.ExportModelType.TF_SAVEDMODEL:
+        self._export_module = tensorflow_module.TensorFlowModule(
+            params=params,
+            apply_fn=apply_fn,
+            trainable=trainable,
+            input_polymorphic_shape=input_polymorphic_shape,
+            jit_compile=jit_compile,
+            pspecs=pspecs,
+            allow_multi_axis_sharding_consolidation=allow_multi_axis_sharding_consolidation,
+            jax2tf_kwargs=jax2tf_kwargs,
+            export_version=export_version,
+        )
+      case constants.ExportModelType.ORBAX_MODEL:
+        self._export_module = obm_module.ObmModule(
+            params=params,
+            apply_fn=apply_fn,
+            input_polymorphic_shape=input_polymorphic_shape,
+            input_polymorphic_shape_symbol_values=input_polymorphic_shape_symbol_values,
+            jax2obm_kwargs=jax2obm_kwargs,
+        )
+      case _:
+        raise ValueError(
+            f'Unsupported export version: {export_version}, '
+            'must be one of'
+            f" {', '.join(c.name for c in constants.ExportModelType)}"
+        )
 
   @property
   def apply_fn_map(self) -> Mapping[str, ApplyFn]:
@@ -143,7 +174,7 @@ class JaxModule(orbax_module_base.OrbaxModuleBase):
     """Returns the jax2tf_kwargs_map."""
     if self._export_version == constants.ExportModelType.ORBAX_MODEL:
       raise TypeError(
-          'update_variables is not implemented for export version'
+          'jax2tf_kwargs_map is not implemented for export version'
           ' ExportModelType.ORBAX_MODEL.'
       )
     return cast(
@@ -155,7 +186,7 @@ class JaxModule(orbax_module_base.OrbaxModuleBase):
     """Returns the polymorphic shapes."""
     if self._export_version == constants.ExportModelType.ORBAX_MODEL:
       raise TypeError(
-          'update_variables is not implemented for export version'
+          'input_polymorphic_shape_map is not implemented for export version'
           ' ExportModelType.ORBAX_MODEL.'
       )
     return cast(
@@ -167,7 +198,7 @@ class JaxModule(orbax_module_base.OrbaxModuleBase):
     """Returns the with_gradient."""
     if self._export_version == constants.ExportModelType.ORBAX_MODEL:
       raise TypeError(
-          'obm_module_to_jax_exported_map is not implemented for export version'
+          'with_gradient is not implemented for export version'
           ' ExportModelType.ORBAX_MODEL.'
       )
     return cast(

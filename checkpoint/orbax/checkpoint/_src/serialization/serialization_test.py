@@ -37,9 +37,14 @@ import tensorstore as ts
 
 NamedSharding = jax.sharding.NamedSharding
 P = jax.sharding.PartitionSpec
-DLL = layout.DeviceLocalLayout
-Layout = layout.Layout
-
+if jax.__version_info__ >= (0, 6, 3):
+  DLL = layout.Layout
+else:
+  DLL = layout.DeviceLocalLayout  # type: ignore
+if jax.__version_info__ >= (0, 6, 2):
+  Format = layout.Format
+else:
+  Format = layout.Layout
 jax.config.update('jax_enable_x64', True)
 
 
@@ -157,6 +162,15 @@ class CheckpointTest(parameterized.TestCase):
 
   def assertDtypesMatch(self, x, y):
     self.assertEqual(_dtype(x), _dtype(y))
+
+  def add_monitoring_listener(self) -> list[tuple[str, dict[str, Any]]]:
+    """Adds a listener to capture Jax monitoring, returns a list of events."""
+    jax_events = []
+    jax.monitoring.clear_event_listeners()
+    def monitoring_listener(event, **kwargs):
+      jax_events.append((event, kwargs))
+    jax.monitoring.register_event_listener(monitoring_listener)
+    return jax_events
 
   def test_memory_consumption(self):
     global_mesh = create_global_mesh((2, 4), ('x', 'y'))
@@ -292,6 +306,8 @@ class CheckpointTest(parameterized.TestCase):
 
   @parameterized.product(input_dtype=[np.int32, jnp.bfloat16])
   def test_checkpointing_with_bigger_shape_jax_array(self, input_dtype):
+    monitoring_events = self.add_monitoring_listener()
+
     global_mesh = create_global_mesh((2, 2), ('x', 'y'))
     global_input_shape = (8, 2)
     num = math.prod(global_input_shape)
@@ -333,6 +349,12 @@ class CheckpointTest(parameterized.TestCase):
     (m2,) = deserialize([new_ds], tspecs, [(8, 2)], [np.float32])
     for l in m2.addressable_shards:
       self.assertArraysEqual(l.data, global_input_data1.astype('float32'))
+
+    self.assertLen(monitoring_events, 1)
+    self.assertEqual(
+        ('/jax/orbax/checkpoint/deserialize/shard_shape_changed', {}),
+        monitoring_events[0],
+    )
 
   @parameterized.product(input_dtype=[jnp.int4, jnp.int8])
   def test_checkpointing_with_int4(self, input_dtype):
@@ -585,11 +607,15 @@ class CheckpointTest(parameterized.TestCase):
     np_inp = np.arange(32).reshape(8, 4)
     s = NamedSharding(mesh, P('x', 'y'))
     arr = jax.device_put(np_inp, s)
-
-    out_layout = Layout(
-        device_local_layout=DLL(
-            arr.layout.device_local_layout.major_to_minor[::-1],
-            arr.layout.device_local_layout._tiling,
+    arr_layout = (
+        arr.format.layout
+        if jax.__version_info__ >= (0, 6, 3)
+        else arr.format.device_local_layout  # type: ignore
+    )
+    out_layout = Format(
+        DLL(
+            arr_layout.major_to_minor[::-1],
+            arr_layout._tiling,
         ),
         sharding=arr.sharding,
     )
@@ -605,7 +631,7 @@ class CheckpointTest(parameterized.TestCase):
 
     (out,) = deserialize([out_layout], tspecs)
 
-    self.assertEqual(out.layout, out_layout)
+    self.assertEqual(out.format, out_layout)
     self.assertIsInstance(out, jax.Array)
     self.assertArraysEqual(out, np_inp)
     for s in out.addressable_shards:

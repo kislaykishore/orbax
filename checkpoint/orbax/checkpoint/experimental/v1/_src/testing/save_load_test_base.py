@@ -22,6 +22,7 @@ import asyncio
 import dataclasses
 import json
 import threading
+import time
 from typing import Awaitable
 from unittest import mock
 
@@ -39,6 +40,7 @@ from orbax.checkpoint._src.serialization import serialization
 from orbax.checkpoint._src.tree import utils as tree_utils
 import orbax.checkpoint.experimental.v1 as ocp
 from orbax.checkpoint.experimental.v1._src.handlers import registration
+from orbax.checkpoint.experimental.v1._src.layout import checkpoint_layout
 from orbax.checkpoint.experimental.v1._src.path import types as path_types
 from orbax.checkpoint.experimental.v1._src.synchronization import multihost
 from orbax.checkpoint.experimental.v1._src.testing import array_utils as array_test_utils
@@ -49,6 +51,7 @@ from orbax.checkpoint.experimental.v1._src.tree import types as tree_types
 
 PyTree = tree_types.PyTree
 Path = path_types.Path
+InvalidLayoutError = checkpoint_layout.InvalidLayoutError
 
 create_sharded_array = array_test_utils.create_sharded_array
 create_numpy_pytree = array_test_utils.create_numpy_pytree
@@ -257,6 +260,17 @@ class SaveLoadTestBase:
           self.skipTest('Must provide abstract_pytree for Pathways.')
         test_utils.assert_tree_equal(
             self, [jax_arr], ocp.load_pytree(self.directory / subdir)
+        )
+
+      with self.subTest('jax_to_numpy_by_value'):
+        subdir = 'jax_to_np_by_value'
+        ocp.save_pytree(self.directory / subdir, [jax_arr])
+        test_utils.assert_tree_equal(
+            self,
+            [numpy_arr],
+            ocp.load_pytree(
+                self.directory / subdir, [np.array([], dtype=np.int64)]
+            ),
         )
 
     def test_empty_array(self):
@@ -500,9 +514,7 @@ class SaveLoadTestBase:
       ocp.save_checkpointables(self.directory, checkpointables)
 
       with self.subTest('load_pytree'):
-        with self.assertRaisesRegex(
-            FileNotFoundError, 'must contain a subdirectory named "pytree"'
-        ):
+        with self.assertRaises(InvalidLayoutError):
           ocp.load_pytree(self.directory)
 
       with self.subTest('load_checkpointables'):
@@ -844,11 +856,71 @@ class SaveLoadTestBase:
         ocp.save_checkpointables(self.directory, checkpointables)
 
     def test_load_does_not_exist(self):
-      with self.assertRaises(FileNotFoundError):
+      with self.assertRaises(InvalidLayoutError):
         ocp.load_checkpointables(self.directory / 'foobar')
 
     def test_load_tmp_checkpoint(self):
       tmp_checkpoint_dir = self.directory / 'foo.orbax-checkpoint-tmp-1234'
-      tmp_checkpoint_dir.mkdir(parents=True, exist_ok=False)
-      with self.assertRaisesRegex(ValueError, 'Found incomplete checkpoint'):
+      tmp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+      with self.assertRaises(InvalidLayoutError):
         ocp.load_checkpointables(tmp_checkpoint_dir)
+
+    def test_async_save_completes_without_result(self):
+      self.enter_context(
+          mock.patch.object(atomicity, '_create_paths', _sleep_and_create_paths)
+      )
+      ocp.save_checkpointables_async(
+          self.directory, dict(baz=handler_utils.Baz(123, 'hi'))
+      )
+      self.assertFalse(self.directory.exists())
+      time.sleep(3)
+      self.assertTrue(self.directory.exists())
+
+    def test_partial_restore_placeholder(self):
+      ocp.save_pytree(self.directory, self.pytree)
+
+      reference_pytree = jax.tree.map(lambda x: x, self.abstract_pytree)
+      reference_pytree['b'] = PLACEHOLDER
+      reference_pytree['c']['e'] = PLACEHOLDER
+      reference_pytree['x'] = PLACEHOLDER
+
+      expected = {
+          'a': self.pytree['a'],
+          'b': PLACEHOLDER,
+          'c': {
+              'a': self.pytree['c']['a'],
+              'e': PLACEHOLDER,
+          },
+          'x': PLACEHOLDER,
+          'y': self.pytree['y'],
+      }
+
+      loaded = ocp.load_pytree(self.directory, reference_pytree)
+      test_utils.assert_tree_equal(self, expected, loaded)
+
+    def test_partial_restore_omission(self):
+      ocp.save_pytree(self.directory, self.pytree)
+
+      reference_pytree = jax.tree.map(lambda x: x, self.abstract_pytree)
+      del reference_pytree['b']
+      del reference_pytree['c']['e']
+      del reference_pytree['x']
+
+      expected = {
+          'a': self.pytree['a'],
+          'c': {
+              'a': self.pytree['c']['a'],
+          },
+          'y': self.pytree['y'],
+      }
+
+      with ocp.Context(
+          pytree_options=ocp.options.PyTreeOptions(
+              loading=ocp.options.PyTreeOptions.Loading(
+                  partial_load=True,
+              )
+          )
+      ):
+        loaded = ocp.load_pytree(self.directory, reference_pytree)
+
+      test_utils.assert_tree_equal(self, expected, loaded)

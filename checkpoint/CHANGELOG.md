@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add support for loading SafeTensors checkpoints
+- #v1 Add `is_orbax_checkpoint()` method for validation checks
+
+### Changed
+
+- Modify `loading.load_pytree()` method to automatically detect and handle
+different formats
+- #v1 Adjust v0/v1 compatibility with CheckpointLayout loading logic.
+Require users to explicitly configure a layout if it is not Orbax.
+- #v1 Update all V1 Codes work with V1 (De)SerializationParams and Metadata.
+  Avoid mixing with V0 ones.
+- #v1 Add LeafHandlerRegistry and make it as default for V1 codes
+- #v1 Update LeafHandlerRegistry to work handler type only.
+
+## [0.11.19] - 2025-07-08
+
+### Added
+
+- #v1 Add dummy `orbax.checkpoint` file to help identify checkpoints.
+- #v1 Add StringLeafHandler
+
+### Changed
+
+- Additional fixes and temporary options for Cloud users.
+
+## [0.11.18] - 2025-07-01
+
+### Changed
+
+- For JAX>=0.6.2, JAX layout.Layout renamed to layout.Format
+
+## [0.11.17] - 2025-06-30
+
+### Added
+
+- #v1 Add `PreservationPolicy` support in Checkpointer.
+- Fix rmtree behavior for GCS HNS enabled buckets.
+- #v1 Update AbstractScalar as a simple `Type`
+
+### Changed
+
+- #v1 remove unnecessary warnings when leaf handlers are added into existing
+type handler registry
+
+## [0.11.16] - 2025-06-18
+
+### Changed
+
+- make sure the GitHub build.yml allow to install newer jax-version
+- #v1 Modify saving code to eliminate cross-thread event loop sharing.
+
+## [0.11.15] - 2025-06-13
+
+### Changed
+
+- #emergency-checkpoint Stop including barrier processes in barrier names. This
+information should be redundant, since the barrier ID always corresponds 1:1
+with the provided processes ('local_all_steps':
+processes_excepting_primary_slice, 'find_complete_slice`: all_processes).
+- #emergency-checkpoint Support a `keep_period` like the regular
+`CheckpointManager`.
+- #v1 Default using V1 LeafHandlers
+
 ## [0.11.14] - 2025-06-09
 
 ### Added
@@ -21,6 +86,7 @@ a `PathAwaitingCreation`.
  case.
 - #v1 Add NumpyLeafHandler.
 - #v1 Add NumpyLeafHandler into CompatibleTypeHandler.
+- #v1 Add ScalarLeafHandler and it into CompatibleTypeHandler.
 
 ### Fixed
 
@@ -31,10 +97,12 @@ a `PathAwaitingCreation`.
 - #v1 Allow `load_pytree` to specify the checkpointable_name, with `pytree` as
  default value.
 - #v1 Use an implementation of `load` independent of `v0.Checkpointer`.
+- #v1 Use an implementation of `save` independent of `v0.Checkpointer`.
 - #v1 Distinguish between `force` and `overwrite` save params.
 - Enable `pinned_host_transfer` for GPU backend only.
 - #perf Add/update logs with time logs for save paths.
 - Simplify str of NameFormats.
+- `LoadCheckpointFromOrbax()` expects correct `weight_names` and `weight_specs`.
 
 ## [0.11.13] - 2025-04-30
 

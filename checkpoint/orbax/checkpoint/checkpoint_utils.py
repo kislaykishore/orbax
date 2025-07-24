@@ -14,6 +14,7 @@
 
 """High-level checkpoint utils provided for user convenience."""
 
+import asyncio
 import contextlib
 import time
 from typing import Any, Callable, Iterator, Optional
@@ -35,7 +36,10 @@ from orbax.checkpoint._src.serialization import type_handlers
 PyTree = Any
 STANDARD_ARRAY_TYPES = (int, float, np.ndarray, jax.Array)
 _SNAPSHOTS = '_SNAPSHOTS'
-Layout = layout.Layout
+if jax.__version_info__ >= (0, 6, 2):
+  Format = layout.Format
+else:
+  Format = layout.Layout
 PLACEHOLDER = type_handlers.PLACEHOLDER
 
 
@@ -67,31 +71,31 @@ def _snapshot_checkpoint(
     snapshot_dir: Optional[epath.Path] = None,
 ):
   """Uses `Snapshot` class to create a cheap "copy" of the checkpoint."""
-  if multihost.process_index() == 0:
-    logging.info('Snpashotting step: %d.', step)
-    step_dir = step_name_format.find_step(checkpoint_dir, step).path
-    if not step_dir.exists():
-      raise ValueError(f'Step directory {step_dir} does not exist.')
+  if multihost.process_index() != 0:
+    return False
 
-    if snapshot_dir is None:
-      snapshot_dir = checkpoint_dir / _SNAPSHOTS
-    if not snapshot_dir.exists():
-      try:
-        snapshot_dir.mkdir(parents=True, exist_ok=True)
-      except OSError as e:
-        raise ValueError(
-            f'Failed to create snapshot directory {snapshot_dir}. Please'
-            ' provide a snapshot directory instead.'
-        ) from e
+  logging.info('Snapshotting step: %d.', step)
+  step_dir = step_name_format.find_step(checkpoint_dir, step).path
+  if not step_dir.exists():
+    raise ValueError(f'Step directory {step_dir} does not exist.')
 
-    snapshot_path = get_snapshot_dir_from_step_dir(step_dir, snapshot_dir)
-    if epath.Path(snapshot_path).exists():
-      return True
-    snapshot_impl = snapshot_lib.create_instance(str(snapshot_path))
-    dst_path = snapshot_impl.create_snapshot(str(step_dir), str(snapshot_path))
-    if str(snapshot_path) == dst_path:
-      return True
-  return False
+  if snapshot_dir is None:
+    snapshot_dir = checkpoint_dir / _SNAPSHOTS
+  if not snapshot_dir.exists():
+    try:
+      snapshot_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+      raise ValueError(
+          f'Failed to create snapshot directory {snapshot_dir}. Please'
+          ' provide a snapshot directory instead.'
+      ) from e
+
+  snapshot_path = get_snapshot_dir_from_step_dir(step_dir, snapshot_dir)
+  if epath.Path(snapshot_path).exists():
+    return True
+  snapshot_impl = snapshot_lib.create_instance(step_dir, snapshot_path)
+  asyncio.run(snapshot_impl.create_snapshot())
+  return True
 
 
 def _release_snapshot(
@@ -106,8 +110,8 @@ def _release_snapshot(
     if snapshot_dir is None:
       snapshot_dir = checkpoint_dir / _SNAPSHOTS
     snapshot_path = snapshot_dir / step_name_format.build_name(step)
-    snapshot_impl = snapshot_lib.create_instance(str(snapshot_path))
-    snapshot_impl.release_snapshot(str(snapshot_path))
+    snapshot_impl = snapshot_lib.create_instance(checkpoint_dir, snapshot_path)
+    asyncio.run(snapshot_impl.release_snapshot())
 
 
 def _reached_desired_step(step: int, until_step: Optional[int]) -> bool:
@@ -331,12 +335,12 @@ def checkpoints_iterator(
       step_prefix=step_prefix,
       step_format_fixed_length=step_format_fixed_length,
   )
-  snapshot_impl = snapshot_lib.create_instance(str(checkpoint_dir))
   if snapshot_dir is None:
     snapshot_dir = checkpoint_dir / _SNAPSHOTS
   if snapshot_dir.exists():
     for step_dir in snapshot_dir.iterdir():
-      snapshot_impl.release_snapshot(str(step_dir))
+      snapshot_impl = snapshot_lib.create_instance(checkpoint_dir, step_dir)
+      asyncio.run(snapshot_impl.release_snapshot())
   checkpoint_step = None
   while True:
     until_step = checkpoint_step + 1 if checkpoint_step is not None else None
@@ -428,7 +432,7 @@ def construct_restore_args(
 
   def _array_restore_args(
       value: Any,
-      sharding: Optional[jax.sharding.Sharding | Layout],
+      sharding: Optional[jax.sharding.Sharding | Format],  # pytype: disable=unsupported-operands
       dtype: Optional[np.dtype] = None,
   ) -> type_handlers.ArrayRestoreArgs:
     return type_handlers.ArrayRestoreArgs(
@@ -483,11 +487,15 @@ def construct_restore_args(
     if hasattr(value, 'sharding'):
       if (
           support_layout
-          and hasattr(value, 'layout')
-          and value.layout.device_local_layout
+          and hasattr(value, 'format')
+          and (
+              value.format.layout
+              if jax.__version_info__ >= (0, 6, 3)
+              else value.format.device_local_layout  # type: ignore
+          )
       ):
         # value is a jax.Array or a jax.ShapeDtypeStruct.
-        return value.layout
+        return value.format
       else:
         return value.sharding
     else:

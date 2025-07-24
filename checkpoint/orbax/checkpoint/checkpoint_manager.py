@@ -22,7 +22,7 @@ import datetime
 import threading
 import time
 import typing
-from typing import Any, Callable, Container, Iterable, List, Mapping, Optional, overload, Sequence, Tuple, Type, Union
+from typing import Any, Callable, Container, Iterable, List, Mapping, Optional, Sequence, Tuple, Type, Union, overload
 
 from absl import logging
 from etils import epath
@@ -41,6 +41,7 @@ from orbax.checkpoint._src.checkpoint_managers import save_decision_policy as sa
 from orbax.checkpoint._src.checkpointers import abstract_checkpointer
 from orbax.checkpoint._src.checkpointers import async_checkpointer
 from orbax.checkpoint._src.checkpointers import checkpointer as checkpointer_lib
+from orbax.checkpoint._src.futures import synchronization
 from orbax.checkpoint._src.handlers import checkpoint_handler
 from orbax.checkpoint._src.handlers import composite_checkpoint_handler
 from orbax.checkpoint._src.handlers import handler_registration
@@ -219,9 +220,7 @@ def _get_default_preservation_policy(
   if options.keep_time_interval is not None:
     total_seconds = int(options.keep_time_interval.total_seconds())
     preservation_policies.append(
-        preservation_policy_lib.EveryNSeconds(
-            interval_secs=total_seconds
-        )
+        preservation_policy_lib.EveryNSeconds(interval_secs=total_seconds)
     )
   if options.best_fn is not None:
     preservation_policies.append(
@@ -229,15 +228,14 @@ def _get_default_preservation_policy(
             get_metric_fn=options.best_fn,
             reverse=(options.best_mode == 'min'),
             n=options.max_to_keep,
+            keep_checkpoints_without_metrics=options.keep_checkpoints_without_metrics,
         )
     )
   else:
     preservation_policies.append(
         preservation_policy_lib.LatestN(n=options.max_to_keep)
     )
-  return preservation_policy_lib.AnyPreservationPolicy(
-      preservation_policies
-  )
+  return preservation_policy_lib.AnyPreservationPolicy(preservation_policies)
 
 
 # TODO(b/268051457) Clean up when no longer depended upon by internal users.
@@ -307,6 +305,8 @@ class CheckpointManagerOptions:
     deleted from the file system. Useful if checkpoint deletion is time
     consuming. By default, delete the checkpoint assets. Ignored if file system
     is Google Cloud Storage (directory is prefixed with gs://)
+  enable_hns_rmtree: If True, enables additional step of HNS bucket empty folder
+    deletion.
   enable_background_delete: If True, old checkpoint deletions will be done in a
     background thread, otherwise, it will be done at the end of each save.  When
     it's enabled, make sure to call CheckpointManager.close() or use context to
@@ -344,6 +344,12 @@ class CheckpointManagerOptions:
     checkpoints to preserve. If not provided, these other options are used
     instead. Prefer to use this option over others.
   prevent_write_metrics: False by default. If True, metrics will not be written.
+  enable_should_save_is_saving_in_progress_check: True by default. If False,
+    `should_save_fn` will not check `is_saving_in_progress`, and will assume
+    that no save is in progress. This only affects users of
+    `ContinuousCheckpointingPolicy` - otherwise the value is ignored.
+    This is an interim workaround for b/428061876. Do not use
+    without explicit approval.
   """
 
   save_interval_steps: int = 1
@@ -362,6 +368,7 @@ class CheckpointManagerOptions:
   save_on_steps: Optional[Container[int]] = None
   single_host_load_and_broadcast: bool = False
   todelete_subdir: Optional[str] = None
+  enable_hns_rmtree: bool = False
   enable_background_delete: bool = False
   read_only: bool = False
   enable_async_checkpointing: bool = True
@@ -376,10 +383,12 @@ class CheckpointManagerOptions:
   save_decision_policy: Optional[
       save_decision_policy_lib.SaveDecisionPolicy
   ] = None
-  preservation_policy: Optional[
-      preservation_policy_lib.PreservationPolicy
-  ] = None
+  preservation_policy: Optional[preservation_policy_lib.PreservationPolicy] = (
+      None
+  )
   prevent_write_metrics: bool = False
+  # TODO(b/428061876) Remove this option.
+  enable_should_save_is_saving_in_progress_check: bool = True
 
   def __post_init__(self):
     step_name_format_single_host_load_and_broadcast = (
@@ -707,8 +716,8 @@ class CheckpointManager(AbstractCheckpointManager, epy.ContextManager):
       raise ValueError(
           'Deprecated `checkpointers` can not be used with `handler_registry`.'
           ' Please follow the instructions at'
-          ' https://orbax.readthedocs.io/en/latest/api_refactor.html to'
-          ' migrate.'
+          ' https://orbax.readthedocs.io/en/latest/guides/checkpoint/api_refactor.html'
+          ' to migrate.'
       )
 
     if item_handlers is not None and handler_registry is not None:
@@ -740,8 +749,8 @@ class CheckpointManager(AbstractCheckpointManager, epy.ContextManager):
       logging.warning(
           'Configured `CheckpointManager` using deprecated legacy API. Please'
           ' follow the instructions at'
-          ' https://orbax.readthedocs.io/en/latest/api_refactor.html to'
-          ' migrate.'
+          ' https://orbax.readthedocs.io/en/latest/guides/checkpoint/api_refactor.html'
+          ' to migrate.'
       )
       self._default_item.set(isinstance(checkpointers, AbstractCheckpointer))
       self._checkpointer = self._configure_checkpointer_legacy_init(
@@ -842,8 +851,15 @@ class CheckpointManager(AbstractCheckpointManager, epy.ContextManager):
             self._directory,
             self._options.todelete_subdir,
             self._step_name_format,
+            self._options.enable_hns_rmtree,
             self._options.enable_background_delete,
         )
+    )
+
+    self._save_progress_tracker = synchronization.MultihostSynchronizedValue(
+        value=False,
+        multiprocessing_options=self._multiprocessing_options,
+        async_options=self._options.async_options,
     )
 
     logging.info(
@@ -856,28 +872,6 @@ class CheckpointManager(AbstractCheckpointManager, epy.ContextManager):
         self.directory,
         self,
     )
-
-  def _create_thread_safe_barrier_sync_fn(self) -> Callable[[str], None]:
-    """Returns a barrier sync function to be called from threads.
-
-    The function accepts a key, but the timeout is already set up using
-    `AsyncOptions.timeout_secs` attribute.
-
-    The Jax based barrier sync util, `sync_global_devices`, should not be called
-    concurrently. Otherwise, it may cause a deadlock.
-
-    In general, any Jax function with `collectives` should not be called
-    concurrently to avoid deadlocks.
-    """
-    async_options = self._options.async_options or AsyncOptions()
-    timeout_secs = async_options.timeout_secs
-    barrier_sync_fn = (
-        async_options.barrier_sync_fn
-        or multihost.get_barrier_sync_fn(
-            processes=self._multiprocessing_options.active_processes
-        )
-    )
-    return lambda key: barrier_sync_fn(key=key, timeout_ms=timeout_secs * 1000)
 
   def _configure_checkpointer_common(
       self,
@@ -1154,7 +1148,10 @@ class CheckpointManager(AbstractCheckpointManager, epy.ContextManager):
     if last_checkpoint_step is not None and last_checkpoint_step >= step:
       return False
 
-    is_saving_in_progress = self.is_saving_in_progress()
+    if self._options.enable_should_save_is_saving_in_progress_check:
+      is_saving_in_progress = self.is_saving_in_progress()
+    else:
+      is_saving_in_progress = False
     reached_preemption = self.reached_preemption(step)
     current_step_info = checkpoint_info.CheckpointInfo(
         step=step,
@@ -1369,7 +1366,9 @@ class CheckpointManager(AbstractCheckpointManager, epy.ContextManager):
         '/jax/checkpoint/write/wait_for_prev_duration_secs',
         step_stats.wait_for_prev_duration_secs,
     )
-
+    # We consider the save in progress only when we have finished waiting for
+    # previous save to complete.
+    self._save_progress_tracker.set(True)
     if step in self.all_steps():
       raise StepAlreadyExistsError(
           f'Checkpoint for step {step} already exists.'
@@ -1422,43 +1421,12 @@ class CheckpointManager(AbstractCheckpointManager, epy.ContextManager):
     args = args_lib.Composite(**args_dict)
 
     save_directory = self._get_write_step_directory(step, self.directory)
-    # If a folder for the step to save exists and is not finalized, remove the
-    # existing folder.
-    if step_lib.is_gcs_path(self.directory):
-      if (
-          utils.is_primary_host(self._multiprocessing_options.primary_host)
-          and save_directory.exists()
-          and utils.is_tmp_checkpoint(save_directory)
-      ):
-        logging.warning(
-            '[process=%s] Attempting to save on GCS at step %s which has an'
-            ' unfinalized checkpoint from previous runs. Removing the'
-            ' unfinalized checkpoint before saving.',
-            process_index,
-            step,
-        )
-        # make sure to use a synchronous deleter here
-        deleter.create_checkpoint_deleter(
-            self._multiprocessing_options.primary_host,
-            self._directory,
-            self._options.todelete_subdir,
-            self._step_name_format,
-            enable_background_delete=False,  # no background thread
-        ).delete(step)
-      multihost.sync_global_processes(
-          multihost.unique_barrier_key(
-              'CheckpointManager:delete_unfinalized_step_gcs',
-              prefix=self._multiprocessing_options.barrier_sync_key_prefix,
-          ),
-          timeout=multihost.DIRECTORY_DELETION_TIMEOUT,
-          processes=self._multiprocessing_options.active_processes,
-      )
     logging.info(
         '[process=%s] Saving checkpoint at step %d', process_index, step
     )
     step_stats.checkpointer_blocking_start_time = time.time()
     self._checkpointer.save(
-        save_directory, args=args, custom_metadata=custom_metadata
+        save_directory, args=args, custom_metadata=custom_metadata, force=True
     )
     step_stats.checkpointer_blocking_duration_secs = (
         time.time() - step_stats.checkpointer_blocking_start_time
@@ -1493,7 +1461,10 @@ class CheckpointManager(AbstractCheckpointManager, epy.ContextManager):
     if is_async_checkpointer(self._checkpointer):
 
       def launch_finalize_thread() -> _FinalizeThread:
-        assert not self.is_saving_in_progress(), (
+        is_finalize_in_progress = self._finalize_thread.map(
+            lambda t: t is not None and t.is_alive()
+        )
+        assert not is_finalize_in_progress, (
             'Save finalization already in progress for'
             f' step={self._finalize_thread.get_not_none().step()}'
         )
@@ -1689,19 +1660,7 @@ class CheckpointManager(AbstractCheckpointManager, epy.ContextManager):
 
   # TODO(b/370812224): Deprecate in favor of StepMetadata.metrics
   def metrics(self, step: int) -> Optional[PyTree]:
-    try:
-      # Use handler directly, since this happens in a background thread and
-      # barriers cannot be used. This usage pattern is not
-      # recommended in other contexts.
-      metrics = self._metrics_handler.restore(
-          self._get_read_step_directory(step, self.directory)
-          / METRIC_ITEM_NAME
-      )
-      return metrics
-    except FileNotFoundError as e:
-      logging.warning('Missing metrics for step %d', step)
-      logging.error(e)
-      return None
+    return self._get_metrics(step)
 
   @property
   def _metrics_handler(self) -> CheckpointHandler:
@@ -1793,18 +1752,25 @@ class CheckpointManager(AbstractCheckpointManager, epy.ContextManager):
           processes=self._multiprocessing_options.active_processes,
       )
 
-  def _get_step_metadata(self, step: int) -> StepMetadata:
-    infos = [info for info in self._checkpoints if info.step == step]
-    if not infos:
-      metrics = None
-    else:
-      if len(infos) > 1:
-        logging.warning(
-            'Multiple CheckpointInfos found for step %d. Using the first one.',
-            step,
-        )
-      metrics = infos[0].metrics
+  def _get_metrics(self, step: int) -> PyTree | None:
+    try:
+      # Use handler directly, since this happens in a background thread and
+      # barriers cannot be used. This usage pattern is not
+      # recommended in other contexts.
+      metrics = self._metrics_handler.restore(
+          self._get_read_step_directory(step, self.directory) / METRIC_ITEM_NAME
+      )
+      return metrics
+    except FileNotFoundError:
+      logging.log_first_n(
+          logging.INFO,
+          'Missing metrics for step %d',
+          1,  # log only once
+          step,
+      )
+      return None
 
+  def _get_step_metadata(self, step: int) -> StepMetadata:
     step_metadata = self._checkpointer.metadata(
         self._get_read_step_directory(step, self.directory),
     )
@@ -1818,6 +1784,7 @@ class CheckpointManager(AbstractCheckpointManager, epy.ContextManager):
         step_metadata.item_metadata
     )
 
+    metrics = self._get_metrics(step)
     if metrics is not None:
       validated_metrics = step_metadata_serialization.deserialize(
           {}, metrics=dict(metrics)
@@ -1985,7 +1952,17 @@ class CheckpointManager(AbstractCheckpointManager, epy.ContextManager):
 
   def is_saving_in_progress(self) -> bool:
     """Returns whether a checkpoint save is in progress."""
-    return self._finalize_thread.map(lambda t: t is not None and t.is_alive())
+    start_time = time.time()
+    is_saving_in_progress = self._save_progress_tracker.get()
+    logging.vlog(
+        1,
+        '[process=%s][is_saving_in_progress] is_saving_in_progress=%s,'
+        ' time_taken=%s',
+        multihost.process_index(),
+        is_saving_in_progress,
+        time.time() - start_time,
+    )
+    return is_saving_in_progress
 
   def check_for_errors(self):
     """Checks for any outstanding errors in completed asynchronous save operations.
@@ -2036,39 +2013,35 @@ class CheckpointManager(AbstractCheckpointManager, epy.ContextManager):
     """Finalizes individual items and starts garbage collection."""
     process_index = multihost.process_index()
     current_thread = threading.current_thread()
-    self._non_blocking_metadata_store.wait_until_finished()
-    self._wait_for_checkpointers()
-    # If an error is encountered while waiting for commit futures to complete,
-    # we will not proceed past this point.
-    self._finalize_checkpoint(step)
-    remove_steps_start_time = time.time()
-    self._checkpoint_deleter.delete_steps(steps_to_remove)
-    jax.monitoring.record_event_duration_secs(
-        '/jax/checkpoint/write/remove_steps_duration_secs',
-        time.time() - remove_steps_start_time,
-    )
-    logging.info(
-        '[process=%s][thread=%s][step=%s] CheckpointManager Save Finalize is'
-        ' syncing with other hosts...',
-        process_index,
-        current_thread.name,
-        step,
-    )
-    barrier_sync_fn = self._create_thread_safe_barrier_sync_fn()
-    barrier_sync_fn(
-        multihost.unique_barrier_key(
-            'CheckpointManager:finalize',
-            prefix=self._multiprocessing_options.barrier_sync_key_prefix,
-            suffix=str(step),
-        )
-    )
-    logging.info(
-        '[process=%s][thread=%s][step=%s] CheckpointManager Save Finalize is'
-        ' done on all hosts.',
-        process_index,
-        current_thread.name,
-        step,
-    )
+    try:
+      self._non_blocking_metadata_store.wait_until_finished()
+      self._wait_for_checkpointers()
+      # If an error is encountered while waiting for commit futures to complete,
+      # we will not proceed past this point.
+      self._finalize_checkpoint(step)
+      remove_steps_start_time = time.time()
+      self._checkpoint_deleter.delete_steps(steps_to_remove)
+      jax.monitoring.record_event_duration_secs(
+          '/jax/checkpoint/write/remove_steps_duration_secs',
+          time.time() - remove_steps_start_time,
+      )
+    finally:
+      logging.info(
+          '[process=%s][thread=%s][step=%s] CheckpointManager Save Finalize is'
+          ' syncing with other hosts...',
+          process_index,
+          current_thread.name,
+          step,
+      )
+      # Set save in progress does a barrier sync so we don't need to do it here.
+      self._save_progress_tracker.set(False)
+      logging.info(
+          '[process=%s][thread=%s][step=%s] CheckpointManager Save Finalize is'
+          ' done on all hosts.',
+          process_index,
+          current_thread.name,
+          step,
+      )
 
   def close(self):
     """Waits for outstanding operations to finish and closes internal objects."""

@@ -18,9 +18,11 @@ import dataclasses
 import datetime
 import typing
 from typing import Container, Protocol, Sequence
+from absl import logging
 from orbax.checkpoint import options as options_lib
 from orbax.checkpoint._src.checkpoint_managers import policy_checkpoint_info
 from orbax.checkpoint._src.futures import signaling_client
+from orbax.checkpoint._src.futures import synchronization
 from orbax.checkpoint._src.multihost import multihost
 
 
@@ -51,6 +53,26 @@ class SaveDecisionPolicy(Protocol):
     ...
 
 
+def _log_save_decision(
+    policy_name: str,
+    step: PolicyCheckpointInfo,
+    is_saving: bool,
+) -> None:
+  """Logs the save decision."""
+  if is_saving:
+    logging.vlog(
+        1,
+        f"{policy_name}: Saving checkpoint at step"
+        f" {step.step}).",
+    )
+  else:
+    logging.vlog(
+        1,
+        f"{policy_name}: Not saving checkpoint at step"
+        f" {step.step}).",
+    )
+
+
 @dataclasses.dataclass
 class FixedIntervalPolicy(SaveDecisionPolicy):
   """Checkpoint at a fixed interval."""
@@ -66,7 +88,13 @@ class FixedIntervalPolicy(SaveDecisionPolicy):
   ) -> bool:
     del previous_steps
     del context
-    return step.step % self.interval == 0
+    result = step.step % self.interval == 0
+    _log_save_decision(
+        f"FixedIntervalPolicy (interval={self.interval})",
+        step,
+        result,
+    )
+    return result
 
 
 @dataclasses.dataclass
@@ -84,7 +112,13 @@ class SpecificStepsPolicy(SaveDecisionPolicy):
   ) -> bool:
     del previous_steps
     del context
-    return step.step in self.steps
+    result = step.step in self.steps
+    _log_save_decision(
+        f"SpecificStepsPolicy (steps={self.steps})",
+        step,
+        result,
+    )
+    return result
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -100,23 +134,25 @@ class ContinuousCheckpointingPolicy(SaveDecisionPolicy):
       *,
       context: DecisionContext,
   ) -> bool:
-    if context.is_saving_in_progress:
-      return False
-    if not previous_steps or self.minimum_interval_secs is None:
-      return True
+    def _get_should_save_result() -> bool:
+      if context.is_saving_in_progress:
+        return False
+      if not previous_steps or self.minimum_interval_secs is None:
+        return True
+      return step.time - previous_steps[-1].time >= datetime.timedelta(
+          seconds=self.minimum_interval_secs
+      )
+
     is_primary_host = multihost.is_primary_host(
         context.multiprocessing_options.primary_host
     )
     client = signaling_client.get_signaling_client()
-    result_barrier_key = (
-        f'continuous_checkpointing_policy_should_save_{step.step}/'
-    )
-    # Make time based decision only on primary host and broadcast to all hosts.
+    operation_id = synchronization.OperationIdGenerator.next_operation_id()
+    result_barrier_key = f"{operation_id}_continuous_checkpointing_policy_should_save_{step.step}/"
+    # Make time based and save in progress based decision only on primary host
+    # and broadcast to all hosts.
     if is_primary_host:
-      save_result = int(
-          step.time - previous_steps[-1].time
-          >= datetime.timedelta(seconds=self.minimum_interval_secs)
-      )
+      save_result = int(_get_should_save_result())
       client.key_value_set(
           result_barrier_key,
           str(save_result),
@@ -128,6 +164,12 @@ class ContinuousCheckpointingPolicy(SaveDecisionPolicy):
             result_barrier_key,
             timeout_secs=600,
         )
+    )
+    _log_save_decision(
+        "ContinuousCheckpointingPolicy"
+        f" (minimum_interval_secs={self.minimum_interval_secs})",
+        step,
+        bool(save_result),
     )
     return bool(save_result)
 
@@ -142,6 +184,11 @@ class PreemptionCheckpointingPolicy(SaveDecisionPolicy):
       *,
       context: DecisionContext,
   ) -> bool:
+    _log_save_decision(
+        "PreemptionCheckpointingPolicy",
+        step,
+        context.reached_preemption,
+    )
     del step
     del previous_steps
     return context.reached_preemption
@@ -157,6 +204,11 @@ class InitialSavePolicy(SaveDecisionPolicy):
       *,
       context: DecisionContext,
   ) -> bool:
+    _log_save_decision(
+        "InitialSavePolicy",
+        step,
+        not previous_steps,
+    )
     del step
     del context
     return not previous_steps
@@ -179,6 +231,12 @@ class AnySavePolicy(SaveDecisionPolicy):
       *,
       context: DecisionContext,
   ) -> bool:
+    logging.vlog(
+        1,
+        "AnySavePolicy: policies=%s, step=%d.",
+        self.policies,
+        step.step,
+    )
     return any(
         policy.should_save(step, previous_steps=previous_steps, context=context)
         for policy in self.policies

@@ -16,11 +16,13 @@ import unittest
 from absl.testing import absltest
 from absl.testing import parameterized
 from etils import epath
+from orbax.checkpoint import options as options_lib
 from orbax.checkpoint import test_utils
 from orbax.checkpoint._src.multihost import multihost
 from orbax.checkpoint._src.path import atomicity
 from orbax.checkpoint._src.path import atomicity_types
 from orbax.checkpoint._src.path import step as step_lib
+
 
 AtomicRenameTemporaryPath = atomicity.AtomicRenameTemporaryPath
 CommitFileTemporaryPath = atomicity.CommitFileTemporaryPath
@@ -46,7 +48,7 @@ class AtomicRenameTemporaryPathTest(
       ('ckpt', f'ckpt{TMP_DIR_SUFFIX}11001', True),
       ('state', f'state{TMP_DIR_SUFFIX}1', True),
       ('state', f'state{TMP_DIR_SUFFIX}s', True),
-      ('state', f'state{TMP_DIR_SUFFIX}', False),
+      ('state', f'state{TMP_DIR_SUFFIX}', True),
       ('foo', f'{TMP_DIR_SUFFIX}12', False),
       ('foo', f'f{TMP_DIR_SUFFIX}12', False),
       ('foo', 'foo-checkpoint-tmp-2', False),
@@ -150,6 +152,72 @@ class CommitFileTemporaryPathTest(
     self.assertTrue(tmp_paths[1].get().exists())
     self.assertTrue(paths[0].exists())
     self.assertTrue(paths[1].exists())
+
+
+class ReadOnlyTemporaryPathTest(
+    parameterized.TestCase,
+    unittest.IsolatedAsyncioTestCase,
+):
+
+  def setUp(self):
+    super().setUp()
+    self.directory = epath.Path(self.create_tempdir().full_path)
+
+  @parameterized.named_parameters(
+      {
+          'testcase_name': 'atomic_rename',
+          'temporary_path_cls': AtomicRenameTemporaryPath,
+      },
+      {
+          'testcase_name': 'commit_file',
+          'temporary_path_cls': CommitFileTemporaryPath,
+      },
+  )
+  def test_serialization(self, temporary_path_cls):
+    path = self.directory / 'ckpt'
+    tmp_path = temporary_path_cls.from_final(path)
+    readonly_tmp_path = atomicity.ReadOnlyTemporaryPath.from_paths(
+        temporary_path=tmp_path.get(), final_path=path
+    )
+    deserialized = atomicity.ReadOnlyTemporaryPath.from_bytes(
+        readonly_tmp_path.to_bytes()
+    )
+
+    self.assertEqual(tmp_path.get(), deserialized.get())
+    self.assertEqual(tmp_path.get_final(), deserialized.get_final())
+
+  def test_from_final_raises(self):
+    with self.assertRaises(NotImplementedError):
+      atomicity.ReadOnlyTemporaryPath.from_final(epath.Path('/path/to/ckpt'))
+
+  def test_match(self):
+    self.assertTrue(
+        atomicity.ReadOnlyTemporaryPath.match(
+            epath.Path('/test/ckpt'), epath.Path('/test/ckpt')
+        )
+    )
+    self.assertFalse(
+        atomicity.ReadOnlyTemporaryPath.match(
+            epath.Path('/test/foo'), epath.Path('/test/ckpt')
+        )
+    )
+
+  async def test_create_raises(self):
+    path = atomicity.ReadOnlyTemporaryPath(
+        temporary_path=epath.Path('/path/to/ckpt.orbax-checkpoint-tmp'),
+        final_path=epath.Path('/path/to/ckpt'),
+    )
+    with self.assertRaises(NotImplementedError):
+      await path.create()
+
+  async def test_finalize_raises(self):
+    path = atomicity.ReadOnlyTemporaryPath(
+        temporary_path=epath.Path('/path/to/ckpt.orbax-checkpoint-tmp'),
+        final_path=epath.Path('/path/to/ckpt'),
+    )
+    with self.assertRaises(NotImplementedError):
+      path.finalize(
+      )
 
 
 

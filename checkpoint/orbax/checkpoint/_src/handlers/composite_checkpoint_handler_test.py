@@ -62,10 +62,10 @@ class CompositeCheckpointHandlerTest(parameterized.TestCase):
   def setUp(self):
     super().setUp()
     self.directory = epath.Path(self.create_tempdir(name='test_dir'))
-    synchronization.HandlerAwaitableSignalOperationIdGenerator.next_operation_id()
+    synchronization.OperationIdGenerator.next_operation_id()
 
   def save(self, handler, directory, *args, **kwargs):
-    synchronization.HandlerAwaitableSignalOperationIdGenerator.next_operation_id()
+    synchronization.OperationIdGenerator.next_operation_id()
     handler.save(directory, *args, **kwargs)
     if multihost.process_index() == 0:
       handler.finalize(directory)
@@ -1101,11 +1101,11 @@ class CompositeCheckpointHandlerTest(parameterized.TestCase):
     self.assertIn('state', tmp_dirs.keys())
     self.assertIn('metadata', tmp_dirs.keys())
     self.assertIn(
-        (self.directory / 'state.orbax-checkpoint-tmp-').as_posix(),
+        (self.directory / 'state.orbax-checkpoint-tmp').as_posix(),
         tmp_dirs['state'].get().as_posix(),
     )
     self.assertIn(
-        (self.directory / 'metadata.orbax-checkpoint-tmp-').as_posix(),
+        (self.directory / 'metadata.orbax-checkpoint-tmp').as_posix(),
         tmp_dirs['metadata'].get().as_posix(),
     )
 

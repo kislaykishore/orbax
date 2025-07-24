@@ -25,7 +25,7 @@ from typing import Awaitable, Protocol, Sequence, cast
 from absl import logging
 import jax
 import jax.experimental.layout as jax_layout
-from orbax.checkpoint import utils
+import jax.numpy as jnp
 from orbax.checkpoint._src.arrays import types as arrays_types_v0
 from orbax.checkpoint._src.futures import future
 from orbax.checkpoint._src.metadata import sharding as sharding_metadata
@@ -33,12 +33,16 @@ from orbax.checkpoint._src.metadata import value as value_metadata
 from orbax.checkpoint._src.serialization import type_handlers as type_handlers_v0
 from orbax.checkpoint.experimental.v1._src.context import context as context_lib
 from orbax.checkpoint.experimental.v1._src.serialization import types
-from orbax.checkpoint.google import pathways_type_handlers as pw_type_handlers_v0
 
 
 ArraySerializationParam = types.SerializationParam[jax.Array]
 ArrayDeserializationParam = types.DeserializationParam["AbstractArray"]
 Shape = arrays_types_v0.Shape
+
+if jax.__version_info__ >= (0, 6, 2):
+  Format = jax_layout.Format
+else:
+  Format = jax_layout.Layout
 
 
 class AbstractArray(Protocol):
@@ -64,7 +68,7 @@ class AbstractArray(Protocol):
 
   shape: Shape | None
   dtype: jax.numpy.dtype | None
-  sharding: jax.sharding.Sharding | jax_layout.Layout | None
+  sharding: jax.sharding.Sharding | Format | None  # pytype: disable=unsupported-operands
 
 
 @dataclasses.dataclass
@@ -90,9 +94,10 @@ class ArrayMetadata:
 
   @property
   def sharding(self) -> jax.sharding.Sharding | None:
-    """Returns the jax sharding from the sharding_metadata if possible.
+    """Returns the jax.sharding.Sharding from the sharding_metadata if possible.
 
-    This is needed to comply with the AbstractArray protocol.
+    Exception will be thrown if the hardware topology has changed and the
+    sharding cannot be restored from stored metadata.
     """
     if self.sharding_metadata is None:
       return None
@@ -106,14 +111,16 @@ def _create_v0_array_handler(
 
   saving_options = context.array_options.saving
   primary_host = context.multiprocessing_options.primary_host
-  cls = type_handlers_v0.ArrayHandler
-  return cls(
+  array_handler = type_handlers_v0.ArrayHandler(
       primary_host=primary_host,
       replica_id=None if primary_host is None else 0,
       use_replica_parallel=saving_options.use_replica_parallel,
       enable_write_sharding_file=saving_options.enable_write_sharding_file,
       array_metadata_store=saving_options.array_metadata_store,
   )
+
+
+  return array_handler
 
 
 def _create_v0_saving_paraminfo(
@@ -150,7 +157,9 @@ def _create_v0_savearg(
   if fn:
     storage_options = fn(param.keypath, param.value)
     savearg = type_handlers_v0.SaveArgs(
-        dtype=storage_options.dtype,
+        dtype=jnp.dtype(storage_options.dtype)
+        if storage_options.dtype
+        else None,
         chunk_byte_size=storage_options.chunk_byte_size,
         shard_axes=storage_options.shard_axes,
     )
@@ -203,7 +212,11 @@ def _create_v0_restorearg(
     return type_handlers_v0.ArrayRestoreArgs(restore_type=jax.Array)
   else:
     v = param.value
-    assert isinstance(v, (jax.Array, jax.ShapeDtypeStruct, ArrayMetadata))
+    if not isinstance(v, (jax.Array, jax.ShapeDtypeStruct, ArrayMetadata)):
+      raise ValueError(
+          "ArrayDeserializationParam.value is an unsupported type:"
+          f" {type(v)} for param.name: {param.name}"
+      )
     return type_handlers_v0.ArrayRestoreArgs(
         restore_type=jax.Array,
         dtype=v.dtype,
@@ -230,7 +243,7 @@ class ArrayLeafHandler(types.LeafHandler[jax.Array, AbstractArray]):
         self._context,
     )
 
-    logging.info("ArrayLeafHandler created.")
+    logging.vlog(1, "ArrayLeafHandler created.")
 
   async def serialize(
       self,
@@ -253,10 +266,6 @@ class ArrayLeafHandler(types.LeafHandler[jax.Array, AbstractArray]):
         for p in params
     ]
     saveargs = [_create_v0_savearg(p, self._context) for p in params]
-
-    # make sure the parent directory is created
-    # TODO(dnlng): figure a way to do this simultaneously with DTH transfer.
-    await serialization_context.parent_dir.await_creation()
 
     commit_futures = await self._handler_impl.serialize(
         values, paraminfos, saveargs
@@ -324,8 +333,7 @@ class ArrayLeafHandler(types.LeafHandler[jax.Array, AbstractArray]):
         )
         ret.append(array_metadata)
 
-        if logging.vlog_is_on(1):
-          logging.vlog(1, "array_metadata: %r", array_metadata)
+        logging.vlog(1, "array_metadata: %r", array_metadata)
 
       return ret
 

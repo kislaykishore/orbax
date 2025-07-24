@@ -14,10 +14,12 @@
 
 """Defines free-function interface for saving."""
 
+import asyncio
+import time
 from typing import Any
-import uuid
 
 from etils import epath
+import nest_asyncio
 from orbax.checkpoint._src.checkpointers import async_checkpointer
 from orbax.checkpoint._src.handlers import composite_checkpoint_handler
 from orbax.checkpoint._src.handlers import handler_registration as legacy_handler_registration
@@ -27,7 +29,7 @@ from orbax.checkpoint.experimental.v1._src.handlers import registration as handl
 import orbax.checkpoint.experimental.v1._src.handlers.global_registration  # pylint: disable=unused-import
 from orbax.checkpoint.experimental.v1._src.path import format_utils
 from orbax.checkpoint.experimental.v1._src.path import types as path_types
-from orbax.checkpoint.experimental.v1._src.serialization import registration as serialization_registration
+from orbax.checkpoint.experimental.v1._src.saving import saving_utils
 from orbax.checkpoint.experimental.v1._src.synchronization import types as async_types
 from orbax.checkpoint.experimental.v1._src.tree import types as tree_types
 
@@ -35,7 +37,7 @@ PYTREE_CHECKPOINTABLE_KEY = format_utils.PYTREE_CHECKPOINTABLE_KEY
 
 
 def save_pytree(
-    directory: path_types.PathLike,
+    path: path_types.PathLike,
     pytree: tree_types.PyTreeOf[tree_types.LeafType],
     *,
     overwrite: bool = False,
@@ -47,28 +49,28 @@ def save_pytree(
   `save_async` instead.
 
   Args:
-    directory: The directory to save the checkpoint to.
+    path: The path to save the checkpoint to.
     pytree: The PyTree to save. This may be any JAX PyTree (including custom
       objects registered as PyTrees) consisting of supported leaf types. Default
       supported leaf types include `jax.Array`, `np.ndarray`, simple types like
       `int`, `float`, `str`, and empty nodes. Support for custom leaves is also
       possible by implementing a `LeafTypeHandler`.
-    overwrite: If True, fully overwrites an existing checkpoint in `directory`.
+    overwrite: If True, fully overwrites an existing checkpoint in `path`.
       Otherwise, raises an error if the checkpoint already exists.
     custom_metadata: User-provided custom metadata. An arbitrary
       JSON-serializable dictionary the user can use to store additional
       information. The field is treated as opaque by Orbax.
   """
-  save_pytree_async(
-      directory,
-      pytree,
+  save_checkpointables(
+      path,
+      {PYTREE_CHECKPOINTABLE_KEY: pytree},
       overwrite=overwrite,
       custom_metadata=custom_metadata,
-  ).result()
+  )
 
 
 def save_checkpointables(
-    directory: path_types.PathLike,
+    path: path_types.PathLike,
     checkpointables: dict[str, Any],
     *,
     overwrite: bool = False,
@@ -86,7 +88,7 @@ def save_checkpointables(
   For example, one might do::
 
     ocp.save_checkpointables(
-        directory,
+        path,
         {
             'params': pytree_of_arrays,
             'dataset': pygrain.DatasetIterator(...),
@@ -101,51 +103,36 @@ def save_checkpointables(
         'step': step,
         ...
     }
-    ocp.save_checkpointables(directory, train_state)
+    ocp.save_checkpointables(path, train_state)
 
   This is not the ideal way of doing things because it is then difficult to run
   transformations that involve the entire train state (see the
   `load_and_transform` API).
 
   Args:
-    directory: The directory to save the checkpoint to.
+    path: The path to save the checkpoint to.
     checkpointables: A dictionary of checkpointables. Dictionary keys represent
       the names of the checkpointables, while the values are the checkpointable
       objects themselves.
-    overwrite: If True, fully overwrites an existing checkpoint in `directory`.
+    overwrite: If True, fully overwrites an existing checkpoint in `path`.
       Otherwise, raises an error if the checkpoint already exists.
     custom_metadata: User-provided custom metadata. An arbitrary
       JSON-serializable dictionary the user can use to store additional
       information. The field is treated as opaque by Orbax.
   """
-  save_checkpointables_async(
-      directory,
+  _save_checkpointables_impl(
+      path,
       checkpointables,
       overwrite=overwrite,
       custom_metadata=custom_metadata,
+      async_origin=False,
   ).result()
-
-
-class _SaveResponse(async_types.AsyncResponse[None]):
-  """An `AsyncResponse` representing the result of `save_pytree_async`.
-
-  TODO(cpgaffney): Note that a memory leak is possible if the user does not
-  call `result`.
-  """
-
-  def __init__(self, checkpointer: async_checkpointer.AsyncCheckpointer):
-    self._exception = None
-    self._checkpointer = checkpointer
-
-  def result(self, timeout: float | None = None) -> None:
-    del timeout  # Ignored.
-    self._checkpointer.wait_until_finished()
 
 
 # TODO(b/396190818): Test modification of the context by the user after the
 # save operation is scheduled.
 def save_pytree_async(
-    directory: path_types.PathLike,
+    path: path_types.PathLike,
     pytree: tree_types.PyTreeOf[tree_types.LeafType],
     *,
     overwrite: bool = False,
@@ -163,13 +150,13 @@ def save_pytree_async(
   load the checkpoint or exiting the program.
 
   Args:
-    directory: The directory to save the checkpoint to.
+    path: The path to save the checkpoint to.
     pytree: The PyTree to save. This may be any JAX PyTree (including custom
       objects registered as PyTrees) consisting of supported leaf types. Default
       supported leaf types include `jax.Array`, `np.ndarray`, simple types like
       `int`, `float`, `str`, and empty nodes. Support for custom leaves is also
       possible by implementing a `LeafTypeHandler`.
-    overwrite: If True, fully overwrites an existing checkpoint in `directory`.
+    overwrite: If True, fully overwrites an existing checkpoint in `path`.
       Otherwise, raises an error if the checkpoint already exists.
     custom_metadata: User-provided custom metadata. An arbitrary
       JSON-serializable dictionary the user can use to store additional
@@ -180,7 +167,7 @@ def save_pytree_async(
     Blocking can be done using `response.result()`, which returns `None`.
   """
   return save_checkpointables_async(
-      directory,
+      path,
       {PYTREE_CHECKPOINTABLE_KEY: pytree},
       overwrite=overwrite,
       custom_metadata=custom_metadata,
@@ -188,7 +175,7 @@ def save_pytree_async(
 
 
 def save_checkpointables_async(
-    directory: path_types.PathLike,
+    path: path_types.PathLike,
     checkpointables: dict[str, Any],
     *,
     overwrite: bool = False,
@@ -208,11 +195,11 @@ def save_checkpointables_async(
   load the checkpoint or exiting the program.
 
   Args:
-    directory: The directory to save the checkpoint to.
+    path: The path to save the checkpoint to.
     checkpointables: A dictionary of checkpointables. Dictionary keys represent
       the names of the checkpointables, while the values are the checkpointable
       objects themselves.
-    overwrite: If True, fully overwrites an existing checkpoint in `directory`.
+    overwrite: If True, fully overwrites an existing checkpoint in `path`.
       Otherwise, raises an error if the checkpoint already exists.
     custom_metadata: User-provided custom metadata. An arbitrary
       JSON-serializable dictionary the user can use to store additional
@@ -222,18 +209,57 @@ def save_checkpointables_async(
     An `AsyncResponse` that can be used to block until the save is complete.
     Blocking can be done using `response.result()`, which returns `None`.
   """
-  directory = epath.Path(directory)
+  return _save_checkpointables_impl(
+      path,
+      checkpointables,
+      overwrite=overwrite,
+      custom_metadata=custom_metadata,
+      async_origin=True,
+  )
+
+
+def _save_checkpointables_impl(
+    path: path_types.PathLike,
+    checkpointables: dict[str, Any],
+    *,
+    async_origin: bool,
+    overwrite: bool,
+    custom_metadata: tree_types.JsonType | None,
+) -> async_types.AsyncResponse[None]:
+  """See caller docstrings."""
+  nest_asyncio.apply()
+  context = context_lib.get_context()
+  path = epath.Path(path)
   # Prevent internal mutation from affecting the caller.
   checkpointables = dict(checkpointables)
 
-  directory = epath.Path(directory)
-  ckptr, args = get_v0_checkpointer_and_args(
-      checkpointables, context=context_lib.get_context()
+  start_time = time.time()
+  saving_utils.record_save_start(path, async_origin=async_origin)
+
+  tmp_path = saving_utils.get_temporary_path(path, context=context)
+
+  checkpointables = saving_utils.add_internal_checkpointables(
+      checkpointables, context=context
   )
-  ckptr.save(
-      directory, args=args, force=overwrite, custom_metadata=custom_metadata
+
+  background_awaitable = asyncio.run(
+      saving_utils.run_blocking_save(
+          tmp_path,
+          checkpointables,
+          overwrite=overwrite,
+          context=context,
+      )
   )
-  return _SaveResponse(ckptr)
+
+  return saving_utils.create_save_response(
+      background_awaitable,
+      checkpointables,
+      tmp_path,
+      start_time,
+      context=context,
+      custom_metadata=custom_metadata,
+      async_origin=async_origin,
+  )
 
 
 def get_v0_checkpointer_and_args(
@@ -253,10 +279,9 @@ def get_v0_checkpointer_and_args(
     raise ValueError(
         f'Provided reserved checkpointable keys: {provided_reserved_keys}.'
     )
-  # Global registration ties metrics key to JsonHandler.
-  if metrics:
-    checkpointables[format_utils.METRICS_CHECKPOINTABLE_KEY] = metrics
-
+  checkpointables = saving_utils.add_internal_checkpointables(
+      checkpointables, context=context, metrics=metrics
+  )
 
   handlers = {
       name: handler_registration.resolve_handler_for_save(

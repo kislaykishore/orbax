@@ -17,7 +17,7 @@
 from collections.abc import Callable, Mapping, Sequence
 import copy
 import logging
-from typing import Any, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import jax
 from orbax.export import constants
@@ -39,6 +39,9 @@ class ObmModule(orbax_module_base.OrbaxModuleBase):
       apply_fn: Union[ApplyFn, Mapping[str, ApplyFn]],
       *,
       input_polymorphic_shape: Any = None,
+      input_polymorphic_shape_symbol_values: Union[
+          Mapping[str, PyTree], Mapping[str, Mapping[str, PyTree]], None
+      ] = None,
       jax2obm_kwargs: Union[Mapping[str, Any], None] = None,
   ):
     """Data container for Orbax Model export.
@@ -47,22 +50,42 @@ class ObmModule(orbax_module_base.OrbaxModuleBase):
       params: The model parameter specs (e.g. `jax.ShapeDtypeStruct`s).
       apply_fn: The apply_fn for the model.
       input_polymorphic_shape: polymorhpic shape for the inputs of `apply_fn`.
+      input_polymorphic_shape_symbol_values: optional mapping of symbol names
+        presented in `input_polymorphic_shape` to discrete values (e.g. {'b':
+        (1, 2), 'l': (128, 512)}). When there are multiple ``apply_fn``s in the
+        form of a flat mapping, this argument must be a flat mapping with the
+        same keys (e.g. { 'serving_default': { 'b': (1, 2), 'l': (128, 512)}).
+        When this argument is set, the polymoprhic shape will be concretized to
+        a set of all possible concreteized input shape combinations.
       jax2obm_kwargs: A dictionary of kwargs to pass to the jax2obm conversion
         library. Accepted arguments to jax2obm_kwargs are
         'native_serialization_platforms', 'weights_name', 'checkpoint_path' and
         'polymorphic_constraints'.
     """
 
+    if (
+        input_polymorphic_shape is None
+        and input_polymorphic_shape_symbol_values is not None
+    ):
+      raise ValueError(
+          '`input_polymorphic_shape` is required when'
+          ' `input_polymorphic_shape_symbol_values` is provided.'
+      )
+
     # It is possible for jax2obm_kwargs to be None if the key is present.
     if not jax2obm_kwargs:
       jax2obm_kwargs = {}
 
-    self._apply_fn_map, self.input_polymorphic_shape_map = (
-        self._normalize_apply_fn_map(apply_fn, input_polymorphic_shape)
+    (
+        self._apply_fn_map,
+        self.input_polymorphic_shape_map,
+        self.input_polymorphic_shape_symbol_values_map,
+    ) = self._normalize_apply_fn_map(
+        apply_fn,
+        input_polymorphic_shape,
+        input_polymorphic_shape_symbol_values,
     )
 
-    # TODO(b/380323586): Look into if we should create a xla_compile_options
-    # with default values for the users.
     self._xla_compile_options = jax2obm_kwargs.get(
         constants.XLA_COMPILE_OPTIONS, None
     )
@@ -76,7 +99,6 @@ class ObmModule(orbax_module_base.OrbaxModuleBase):
     self._native_serialization_platforms = utils.get_lowering_platforms(
         jax2obm_kwargs
     )
-
     self._params_args_spec = params
 
     self._checkpoint_path: str = None
@@ -87,38 +109,88 @@ class ObmModule(orbax_module_base.OrbaxModuleBase):
       self,
       apply_fn: Union[ApplyFn, Mapping[str, ApplyFn]],
       input_polymorphic_shape: Union[PyTree, Mapping[str, PyTree], None],
-  ) -> Tuple[Mapping[str, ApplyFn], Mapping[str, Union[PyTree, None]]]:
+      input_polymorphic_shape_symbol_values: Union[
+          PyTree, Mapping[str, PyTree], None
+      ],
+  ) -> Tuple[
+      Mapping[str, ApplyFn],
+      Mapping[str, Union[PyTree, None]],
+      Mapping[str, Union[PyTree, None]],
+  ]:
+    """Converts all the inputs to maps that share the same keys."""
+
+    # Single apply_fn case. Will use the default method key.
     if callable(apply_fn):
       apply_fn_map = {constants.DEFAULT_METHOD_KEY: apply_fn}
       input_polymorphic_shape_map = {
           constants.DEFAULT_METHOD_KEY: input_polymorphic_shape
       }
-    elif len(apply_fn) > 1:
+      input_polymorphic_shape_symbol_values_map = {
+          constants.DEFAULT_METHOD_KEY: input_polymorphic_shape_symbol_values
+      }
+      return (
+          apply_fn_map,
+          input_polymorphic_shape_map,
+          input_polymorphic_shape_symbol_values_map,
+      )
+
+    # Mapping from method key to apply_fn.
+    if isinstance(apply_fn, Mapping):
+      if not apply_fn:
+        raise ValueError('`apply_fn` should be a non-empty mapping')
       apply_fn_map = apply_fn
-      input_polymorphic_shape_map = input_polymorphic_shape
-      if not isinstance(input_polymorphic_shape, Mapping):
-        raise TypeError(
-            'When apply_fn is a mapping, input_polymorphic_shape must also be a'
-            ' mapping.'
-        )
-      if len(apply_fn_map) != len(input_polymorphic_shape_map):
-        raise ValueError(
-            f'The size of apply_fn_map:{len(apply_fn_map)} should be equal to'
-            ' the size of'
-            f' input_polymorphic_shape_map:{len(input_polymorphic_shape_map)}.'
-        )
-    else:
-      apply_fn_map = apply_fn
+
+      # Handle `input_polymorphic_shape`
       if input_polymorphic_shape is None:
-        input_polymorphic_shape_map = {constants.DEFAULT_METHOD_KEY: None}
-      elif not isinstance(input_polymorphic_shape, Mapping):
-        raise TypeError(
-            'When apply_fn is a mapping, input_polymorphic_shape must also be a'
-            ' mapping.'
-        )
+        input_polymorphic_shape_map = {key: None for key in apply_fn_map}
       else:
+        if not isinstance(input_polymorphic_shape, Mapping):
+          raise TypeError(
+              '`input_polymorphic_shape` must be a mapping, but got'
+              f' {type(input_polymorphic_shape)}.'
+          )
         input_polymorphic_shape_map = input_polymorphic_shape
-    return apply_fn_map, input_polymorphic_shape_map
+      if apply_fn_map.keys() != input_polymorphic_shape_map.keys():
+        raise ValueError(
+            'The keys of `apply_fn` and `input_polymorphic_shape` should be'
+            f' the same, but got ({apply_fn_map.keys()}) vs'
+            f' ({input_polymorphic_shape_map.keys()})'
+        )
+
+      # Handle `input_polymorphic_shape_symbol_values`
+      if input_polymorphic_shape_symbol_values is None:
+        input_polymorphic_shape_symbol_values_map = {
+            key: None for key in apply_fn_map
+        }
+      else:
+        if not isinstance(input_polymorphic_shape_symbol_values, Mapping):
+          raise TypeError(
+              '`input_polymorphic_shape_symbol_values` must be a mapping, but'
+              f' got {type(input_polymorphic_shape_symbol_values)}.'
+          )
+        input_polymorphic_shape_symbol_values_map = (
+            input_polymorphic_shape_symbol_values
+        )
+      if (
+          apply_fn_map.keys()
+          != input_polymorphic_shape_symbol_values_map.keys()
+      ):
+        raise ValueError(
+            'The keys of `apply_fn` and'
+            ' `input_polymorphic_shape_symbol_values` should be the same, but'
+            f' got ({apply_fn_map.keys()}) vs'
+            f' ({input_polymorphic_shape_symbol_values_map.keys()})'
+        )
+
+      return (
+          apply_fn_map,
+          input_polymorphic_shape_map,
+          input_polymorphic_shape_symbol_values_map,
+      )
+
+    raise TypeError(
+        f'`apply_fn` must be a callable or a mapping, but got {type(apply_fn)}.'
+    )
 
   def _maybe_set_orbax_checkpoint_path(self, jax2obm_kwargs):
     if constants.CHECKPOINT_PATH not in jax2obm_kwargs:

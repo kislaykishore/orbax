@@ -41,7 +41,10 @@ _REMOVED_VALUE = 'Value removed'
 _CHECKPOINT_SUCCESS = 'checkpoint_write_success'
 
 Index = types.Index
-Layout = layout.Layout
+if jax.__version_info__ >= (0, 6, 2):
+  Format = layout.Format
+else:
+  Format = layout.Layout
 Shape = types.Shape
 
 
@@ -402,7 +405,7 @@ async def _read_array_index_and_device_put(
     dtype: jnp.dtype,
     byte_limiter: ByteLimiter,
     strict: bool,
-    dll: Optional[layout.DeviceLocalLayout],
+    dll,
     memory_kind: Optional[str],
 ) -> list[jax.Array]:
   """Callback that reads an array index and places on the devices."""
@@ -456,7 +459,7 @@ async def _read_array_index_and_device_put(
       sharding = jax.sharding.SingleDeviceSharding(
           device, memory_kind=memory_kind
       )
-      result.append(jax.device_put(shard, Layout(dll, sharding)))
+      result.append(jax.device_put(shard, Format(dll, sharding)))  # pytype: disable=wrong-arg-types
   return result
 
 
@@ -475,7 +478,7 @@ async def read_and_create_array(
     dtype: jnp.dtype,
     byte_limiter: ByteLimiter,
     strict: bool,
-    dll: Optional[layout.DeviceLocalLayout],
+    dll,
 ) -> jax.Array:
   """Read shards from TensorStore and create a jax.Array."""
   local_indices_devices_map: dict[types.HashableIndex, list[jax.Device]] = (
@@ -507,7 +510,7 @@ async def read_and_create_array(
 
 
 async def async_deserialize(
-    user_sharding: jax.sharding.Sharding | Layout,
+    user_sharding: jax.sharding.Sharding | Format,  # pytype: disable=wrong-arg-types  # pytype: disable=unsupported-operands
     tensorstore_spec: Union[ts.Spec, Dict[str, Any]],
     global_shape: Optional[Shape] = None,
     dtype: Optional[jnp.dtype] = None,
@@ -522,7 +525,7 @@ async def async_deserialize(
   context = context or ts_utils.get_ts_context(use_ocdbt=False)
   sharding = (
       user_sharding.sharding
-      if isinstance(user_sharding, Layout)
+      if isinstance(user_sharding, Format)
       else user_sharding
   )
   if not isinstance(sharding, jax.sharding.Sharding):
@@ -530,11 +533,16 @@ async def async_deserialize(
         'sharding passed to deserialization should be specified, concrete and'
         f' an instance of `jax.sharding.Sharding`. Got {sharding}'
     )
-  dll = (
-      user_sharding.device_local_layout
-      if isinstance(user_sharding, Layout)
-      else None
-  )
+
+  if isinstance(user_sharding, Format):
+    dll = (
+        user_sharding.layout
+        if jax.__version_info__ >= (0, 6, 3)
+        else user_sharding.device_local_layout  # type: ignore
+    )
+  else:
+    dll = None
+
   t = await ts.open(
       tensorstore_spec,
       open=True,
@@ -543,6 +551,10 @@ async def async_deserialize(
   )
   global_shape = tuple(t.shape if global_shape is None else global_shape)
   new_shard_shape = sharding.shard_shape(global_shape)
+  if new_shard_shape != t.shape:
+    jax.monitoring.record_event(
+        '/jax/orbax/checkpoint/deserialize/shard_shape_changed'
+    )
   return await read_and_create_array(
       t,
       global_shape=global_shape,

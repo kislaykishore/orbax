@@ -117,9 +117,9 @@ def convert_polymorphic_fn(
   ) -> Tuple[obm.tracing.TreeOfGraphEdgeTensors, ...]:
     obm.tracing.assert_tracing()
 
-    utils.assert_jax_trace_state_is_clean()
+    utils.assert_not_in_jax_transformation()
 
-    def jax_arg_spec_from_em(a: EmVal) -> jax.ShapeDtypeStruct:
+    def em_to_jax_arg_spec(a: EmVal) -> jax.ShapeDtypeStruct:
       # The shape and JAX dtype for an EM argument
       em_arg_shape = a.shape
       a_jax_dtype = _to_jax_dtype(a.dtype)  # Give JAX a chance to pick the type
@@ -127,7 +127,7 @@ def convert_polymorphic_fn(
       # contain None.
       return jax.ShapeDtypeStruct(em_arg_shape, a_jax_dtype)
 
-    args_jax_specs = jax.tree_util.tree_map(jax_arg_spec_from_em, args_em)
+    args_jax_specs = jax.tree_util.tree_map(em_to_jax_arg_spec, args_em)
     args_specs = jax_export.symbolic_args_specs(
         args_jax_specs,
         shapes_specs=polymorphic_shapes,
@@ -135,7 +135,7 @@ def convert_polymorphic_fn(
     )
     # The polymorphic_shapes argument refers to positional arguments only.
     # We assume None for the kwargs.
-    kwargs_jax_specs = jax.tree_util.tree_map(jax_arg_spec_from_em, kwargs_em)
+    kwargs_jax_specs = jax.tree_util.tree_map(em_to_jax_arg_spec, kwargs_em)
     kwargs_specs = jax_export.symbolic_args_specs(
         kwargs_jax_specs, shapes_specs=None
     )
@@ -285,7 +285,7 @@ def _to_em_dtype(jax_dtype):
     pass
   if jax_dtype == jax.float0:
     jax_dtype = _em_np_dtype_for_float0
-  return obm.dtype_from_np_dtype(np.dtype(jax_dtype))
+  return obm.np_dtype_to_dtype(np.dtype(jax_dtype))
 
 
 def _to_jax_dtype(em_dtype):

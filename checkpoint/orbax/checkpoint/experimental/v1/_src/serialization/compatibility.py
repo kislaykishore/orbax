@@ -14,12 +14,14 @@
 
 """Compatibility wrapper to help leaf handlers to work as V0 type_handlers."""
 
-import copy
-from typing import Generic, Sequence, Tuple, cast
+import dataclasses
+from typing import Any, Generic, Sequence, Tuple, Type, cast, get_args
+
 from absl import logging
 from etils import epath
 import jax
 from jax import tree_util as jtu
+import jax.numpy as jnp
 import numpy as np
 from orbax.checkpoint._src.futures import future
 from orbax.checkpoint._src.metadata import sharding as sharding_metadata
@@ -30,9 +32,21 @@ from orbax.checkpoint.experimental.v1._src.context import context as context_lib
 from orbax.checkpoint.experimental.v1._src.path import types as path_types
 from orbax.checkpoint.experimental.v1._src.serialization import array_leaf_handler
 from orbax.checkpoint.experimental.v1._src.serialization import numpy_leaf_handler
+from orbax.checkpoint.experimental.v1._src.serialization import scalar_leaf_handler
+from orbax.checkpoint.experimental.v1._src.serialization import string_leaf_handler
 from orbax.checkpoint.experimental.v1._src.serialization import types
 from orbax.checkpoint.experimental.v1._src.synchronization import synchronization
 from orbax.checkpoint.experimental.v1._src.tree import types as tree_types
+
+
+@dataclasses.dataclass
+class V0RestoreArgs(types_v0.RestoreArgs):
+  abstract_leaf: Type[Any] | None = None
+
+
+@dataclasses.dataclass
+class V0Metadata(value_metadata.Metadata):
+  v1_metadata: Any | None = None
 
 
 class _PathAwaitingCreation(path_types.PathAwaitingCreation):
@@ -100,18 +114,28 @@ def _construct_deserialization_param(
     info: types_v0.ParamInfo,
     restore_args: types_v0.RestoreArgs,
 ) -> types.DeserializationParam[
-    array_leaf_handler.AbstractArray | numpy_leaf_handler.AbstractNumpy | None
+    array_leaf_handler.AbstractArray
+    | numpy_leaf_handler.AbstractNumpy
+    | scalar_leaf_handler.AbstractScalar
+    | string_leaf_handler.AbstractString
+    | None
 ]:
   """Constructs a DeserializationParam from a ParamInfo and RestoreArg."""
 
-  value = None
+  logging.vlog(1, 'compatibility.py: restore_args: %s', restore_args)
 
-  # Numpy type
   if restore_args.restore_type == np.ndarray:
+    # Numpy type
     value = numpy_leaf_handler.NumpyShapeDtype(
         dtype=restore_args.dtype,
         shape=None,
     )
+  elif isinstance(restore_args.restore_type, type) and issubclass(
+      restore_args.restore_type, get_args(scalar_leaf_handler.Scalar)
+  ):
+    # Scalar type
+    logging.vlog(1, 'Scalar restore_type set to: %s', restore_args.restore_type)
+    value = restore_args.restore_type
   elif isinstance(restore_args, type_handlers_v0.ArrayRestoreArgs):
     # JAX Array type, construct value as jax.ShapeDtypeStruct.
     arg = cast(type_handlers_v0.ArrayRestoreArgs, restore_args)
@@ -132,7 +156,16 @@ def _construct_deserialization_param(
         sharding = arg.sharding
     else:
       sharding = None
-    value = jax.ShapeDtypeStruct(arg.shape, arg.dtype, sharding=sharding)
+
+    if sharding is None:
+      # it's a numpy type
+      value = numpy_leaf_handler.NumpyShapeDtype(
+          dtype=arg.dtype,
+          shape=arg.shape,
+      )
+    else:
+      # it's a jax.Array type
+      value = jax.ShapeDtypeStruct(arg.shape, arg.dtype, sharding=sharding)
   elif info.write_shape is not None:
     # TODO(dnlng): this is needed due to write_shape is passed into the
     # metadata() call, and then returned metadata will include this write_shape
@@ -148,6 +181,24 @@ def _construct_deserialization_param(
             write_shape=info.write_shape,
         ),
     )
+    logging.vlog(1, 'ArrayMetadata as param.value: %s', value)
+  elif (
+      restore_args.restore_type in (None, int, float)
+      or isinstance(restore_args.restore_type, (np.dtype, jnp.dtype))
+      or issubclass(restore_args.restore_type, np.number)
+  ):
+    # scalar type
+    value = restore_args.restore_type
+  elif issubclass(restore_args.restore_type, str):
+    # string type
+    value = str
+  else:
+    raise ValueError(
+        'Unsupported restore_args: %s. Cannot construct DeserializationParam.'
+        % restore_args
+    )
+
+  logging.vlog(1, 'deserialization_param.value: %r', value)
 
   return types.DeserializationParam(
       keypath=_keypath_from_param_name(info.name),
@@ -210,42 +261,12 @@ def _convert_v1_metadata_to_v0(
     directory: epath.Path | None,
     metadata: array_leaf_handler.AbstractArray,
 ) -> value_metadata.Metadata:
-  """Converts a v1 metadata to a v0 metadata."""
-  if isinstance(metadata, array_leaf_handler.ArrayMetadata):
-    metadata = cast(array_leaf_handler.ArrayMetadata, metadata)
-    ret = value_metadata.ArrayMetadata(
-        name=name,
-        directory=directory,
-        sharding=metadata.sharding_metadata,
-        shape=metadata.shape,
-        dtype=metadata.dtype,
-        storage=metadata.storage_metadata,
-    )
-    logging.info('ArrayMetadata: %s', ret)
-    return ret
-  elif isinstance(metadata, numpy_leaf_handler.NumpyMetadata):
-    metadata = cast(numpy_leaf_handler.NumpyMetadata, metadata)
-    ret = value_metadata.ArrayMetadata(
-        name=name,
-        directory=directory,
-        sharding=None,
-        shape=metadata.shape,
-        dtype=metadata.dtype,
-        storage=metadata.storage_metadata,
-    )
-    logging.info('NumpyMetadata: %s', ret)
-    return ret
-  else:
-    logging.warning(
-        'Unsupported metadata type: %s. Returning value_metadata.Metadata'
-        ' name=%s.',
-        type(metadata),
-        name,
-    )
-    return value_metadata.Metadata(
-        name=name,
-        directory=directory,
-    )
+  """Wrap V1 metadata into V0Metadata."""
+  return V0Metadata(
+      name=name,
+      directory=directory,
+      v1_metadata=metadata,
+  )
 
 
 class CompatibleTypeHandler(
@@ -303,16 +324,30 @@ class CompatibleTypeHandler(
 
     params = []
     if args is None:
-      args = [types_v0.RestoreArgs(restore_type=types.Leaf)] * len(infos)
+      args = [V0RestoreArgs()] * len(infos)
 
     for info, restore_arg in zip(infos, args):
-      if logging.vlog_is_on(1):
-        logging.vlog(1, 'info: %s', info)
-        logging.vlog(1, 'restore_arg: %s', restore_arg)
+      if isinstance(restore_arg, V0RestoreArgs):
+        v0_restore_arg = cast(V0RestoreArgs, restore_arg)
+        abstract_leaf = v0_restore_arg.abstract_leaf
+      else:
+        abstract_leaf = None
 
-      # TODO(dnlng): need to allow passing in _construct_deserialization_param
-      # for different leaf handlers.
-      params.append(_construct_deserialization_param(info, restore_arg))
+      if logging.vlog_is_on(1):
+        logging.vlog(
+            1,
+            'deserialize: restore_arg: %s, info: %s, abstract_leaf: %s',
+            restore_arg,
+            info,
+            abstract_leaf,
+        )
+
+      params.append(
+          types.DeserializationParam(
+              keypath=_keypath_from_param_name(info.name),
+              value=abstract_leaf,
+          )
+      )
 
     info0 = infos[0]
     deserialization_context = _construct_deserialization_context(info0)
@@ -383,42 +418,45 @@ class CompatibleTypeHandler(
       return None
 
 
-def get_compatible_type_handler_registry(
+def get_v0_type_handler_registry(
+    leaf_handler_registry: types.LeafHandlerRegistry,
     context: context_lib.Context | None = None,
-    type_handler_registry: type_handlers_v0.TypeHandlerRegistry | None = None,
-) -> type_handlers_v0.TypeHandlerRegistry:
-  """Returns a V0 type handler registry that using v1 leaf handlers.
-
-  This is a helper function to setup a v0 type handler registry that will be
-  registered all existing v1 leaf handlers.
+):
+  """Returns a v0 type handler registry based on the `leaf_handler_registry`.
 
   Args:
-    context: The context to that will be passed to create leaf handlers.
-    type_handler_registry: The v0 type handler registry to use. If not provided,
-      a new registry will be created.
-
-  Returns:
-    The v0 type handler registry that using standard v1 leaf handlers.
+    leaf_handler_registry: The LeafHandlerRegistry to be used to create a v0
+      type handler registry.
+    context: The Context to be used to default construct the LeafHandlers.
   """
-  if type_handler_registry is None:
-    type_handler_registry = copy.deepcopy(
-        type_handlers_v0.GLOBAL_TYPE_HANDLER_REGISTRY
-    )
 
-  type_handler_registry.add(
-      jax.Array,
-      CompatibleTypeHandler(
-          array_leaf_handler.ArrayLeafHandler(context=context),
-          typestr=type_handlers_v0.JAX_ARRAY_TYPE_STR,
-      ),
-      override=True,
-  )
-  type_handler_registry.add(
-      np.ndarray,
-      CompatibleTypeHandler(
-          numpy_leaf_handler.NumpyLeafHandler(context=context),
-          typestr='np.ndarray',
-      ),
-      override=True,
-  )
-  return type_handler_registry
+  def _get_typestr(leaf_type: Any) -> str:
+    if leaf_type == jax.Array:
+      return type_handlers_v0.JAX_ARRAY_TYPE_STR
+    elif leaf_type == np.ndarray:
+      return 'np.ndarray'
+    elif leaf_type in (int, float, bytes, np.number):
+      return 'scalar'
+    elif leaf_type == str:
+      return 'string'
+    else:
+      return f'{leaf_type!r}'
+
+  # register standardard v1 leaf handlers to the v0 type handler registry.
+  handlers = []
+  for leaf_type, _, leaf_handler_type in leaf_handler_registry.get_all():
+    try:
+      leaf_handler = leaf_handler_type(context=context)  # pytype: disable=wrong-keyword-args
+    except TypeError as e:
+      raise ValueError(
+          f'Failed to default construct LeafHandler[{leaf_type}].  All'
+          ' LeafHandler types must be able to be constructed with a context.'
+      ) from e
+    handlers.append((
+        leaf_type,
+        CompatibleTypeHandler(
+            leaf_handler,
+            typestr=_get_typestr(leaf_type),
+        ),
+    ))
+  return type_handlers_v0.create_type_handler_registry(*handlers)

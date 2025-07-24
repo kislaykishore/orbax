@@ -78,6 +78,12 @@ class NumpyMetadata:
   storage_metadata: value_metadata.StorageMetadata | None
 
 
+def _create_v0_numpy_handler() -> type_handlers_v0.NumpyHandler:
+  """Creates a V0 NumpyHandler."""
+  numpy_handler = type_handlers_v0.NumpyHandler()
+  return numpy_handler
+
+
 def _create_v0_saving_paraminfo(
     param: NumpySerializationParam,
     context: context_lib.Context,
@@ -111,7 +117,9 @@ def _create_v0_savearg(
   if fn:
     storage_options = fn(param.keypath, param.value)
     savearg = type_handlers_v0.SaveArgs(
-        dtype=storage_options.dtype,
+        dtype=np.dtype(storage_options.dtype)
+        if storage_options.dtype
+        else None,
         chunk_byte_size=storage_options.chunk_byte_size,
         shard_axes=storage_options.shard_axes,
     )
@@ -152,14 +160,17 @@ def _create_v0_restorearg(
     return type_handlers_v0.RestoreArgs(restore_type=np.ndarray)
   else:
     v = param.value
-    assert isinstance(
+    if not isinstance(
         v,
         (
             np.ndarray,
             NumpyShapeDtype,
-            value_metadata.ArrayMetadata,
+            NumpyMetadata,
         ),
-    ), f"v is an unsupported type: {type(v)}"
+    ):
+      raise ValueError(
+          f"NumpyDeserializationParam.value is an unsupported type: {type(v)}"
+      )
 
     logging.vlog(1, "name: %s, v.dtype: %s", param.name, v.dtype)
     return type_handlers_v0.RestoreArgs(
@@ -181,9 +192,9 @@ class NumpyLeafHandler(types.LeafHandler[np.ndarray, AbstractNumpy]):
       context: context_lib.Context | None = None,
   ):
     self._context = context_lib.get_context(context)
-    self._handler_impl = type_handlers_v0.NumpyHandler()
+    self._handler_impl = _create_v0_numpy_handler()
 
-    logging.info("NumpyLeafHandler created.")
+    logging.vlog(1, "NumpyLeafHandler created.")
 
   async def serialize(
       self,
@@ -206,8 +217,6 @@ class NumpyLeafHandler(types.LeafHandler[np.ndarray, AbstractNumpy]):
         for p in params
     ]
     saveargs = [_create_v0_savearg(p, self._context) for p in params]
-
-    await serialization_context.parent_dir.await_creation()
 
     commit_futures = await self._handler_impl.serialize(
         values, paraminfos, saveargs
@@ -274,8 +283,7 @@ class NumpyLeafHandler(types.LeafHandler[np.ndarray, AbstractNumpy]):
         )
         ret.append(numpy_metadata)
 
-        if logging.vlog_is_on(1):
-          logging.vlog(1, "numpy_metadata: %r", numpy_metadata)
+        logging.vlog(1, "numpy_metadata: %r", numpy_metadata)
 
       return ret
 

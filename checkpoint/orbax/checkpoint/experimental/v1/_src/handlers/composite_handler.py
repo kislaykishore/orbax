@@ -23,8 +23,10 @@ from absl import logging
 from etils import epath
 from orbax.checkpoint._src.metadata import checkpoint as checkpoint_metadata
 from orbax.checkpoint._src.metadata import step_metadata_serialization
+from orbax.checkpoint._src.multihost import multihost
 from orbax.checkpoint.experimental.v1._src.context import context as context_lib
 from orbax.checkpoint.experimental.v1._src.handlers import registration
+from orbax.checkpoint.experimental.v1._src.handlers import types as handler_types
 import orbax.checkpoint.experimental.v1._src.handlers.global_registration  # pylint: disable=unused-import
 from orbax.checkpoint.experimental.v1._src.path import format_utils
 from orbax.checkpoint.experimental.v1._src.path import types as path_types
@@ -33,9 +35,30 @@ from orbax.checkpoint.experimental.v1._src.path import types as path_types
 StepMetadata = checkpoint_metadata.StepMetadata
 CompositeItemMetadata = checkpoint_metadata.CompositeItemMetadata
 
+ORBAX_CHECKPOINT_INDICATOR_FILE = 'orbax.checkpoint'
+
+
+_V0_ERROR_MESSAGE = (
+    'If your checkpoint was saved with the Orbax V0 API, please follow the'
+    ' instructions at'
+    ' https://orbax.readthedocs.io/en/latest/guides/checkpoint/v1/orbax_v0_to_v1_migration.html'
+    ' to load it with the Orbax V1 API.'
+)
+
 
 def _existing_checkpointable_names(directory: epath.Path) -> set[str]:
   return {p.name for p in directory.iterdir() if p.is_dir()}
+
+
+async def _create_orbax_identifier_file(
+    directory: path_types.PathAwaitingCreation, primary_host: int | None
+):
+  """Creates a file called `orbax.checkpoint` for easy identification."""
+  directory = await directory.await_creation()
+  if multihost.is_primary_host(primary_host):
+    await asyncio.to_thread(
+        (directory / 'orbax.checkpoint').touch, exist_ok=False
+    )
 
 
 class CompositeHandler:
@@ -92,18 +115,24 @@ class CompositeHandler:
     Returns:
       An awaitable that represents a background save operation.
     """
+    context = context_lib.get_context()
+    handlers_for_save = self.get_handlers_for_save(checkpointables)
     save_ops = []
     for checkpointable_name, checkpointable in checkpointables.items():
-      handler = registration.resolve_handler_for_save(
-          self._handler_registry, checkpointable, name=checkpointable_name
-      )
       save_ops.append(
-          handler.save(directory / checkpointable_name, checkpointable)
+          handlers_for_save[checkpointable_name].save(
+              directory / checkpointable_name, checkpointable
+          )
       )
     save_awaitables = await asyncio.gather(*save_ops)
 
     async def _run_background():
-      await asyncio.gather(*save_awaitables)
+      await asyncio.gather(
+          *save_awaitables,
+          _create_orbax_identifier_file(
+              directory, context.multiprocessing_options.primary_host
+          ),
+      )
 
     return _run_background()
 
@@ -129,14 +158,14 @@ class CompositeHandler:
       the checkpoint.
     """
     abstract_checkpointables = abstract_checkpointables or {}
-    loadable_checkpointable_names_to_handlers = self._get_loadable_handlers(
+    handlers_for_load = self.get_handlers_for_load(
         directory, abstract_checkpointables
     )
     existing_checkpointable_names = _existing_checkpointable_names(directory)
     if not abstract_checkpointables:
       abstract_checkpointables = {
           name: None
-          for name in loadable_checkpointable_names_to_handlers.keys()
+          for name in handlers_for_load.keys()
           if name not in format_utils.RESERVED_CHECKPOINTABLE_KEYS
           and name in existing_checkpointable_names
       }
@@ -155,7 +184,7 @@ class CompositeHandler:
         checkpointable_name,
         abstract_checkpointable,
     ) in abstract_checkpointables.items():
-      handler = loadable_checkpointable_names_to_handlers[checkpointable_name]
+      handler = handlers_for_load[checkpointable_name]
       load_ops.append(
           handler.load(
               directory / checkpointable_name,
@@ -181,10 +210,21 @@ class CompositeHandler:
 
     return _run_background()
 
-  def _get_loadable_handlers(
+  def get_handlers_for_save(
+      self, checkpointables: dict[str, Any]
+  ) -> dict[str, handler_types.CheckpointableHandler]:
+    """Returns a mapping from checkpointable name to handler."""
+    return {
+        checkpointable_name: registration.resolve_handler_for_save(
+            self._handler_registry, checkpointable, name=checkpointable_name
+        )
+        for checkpointable_name, checkpointable in checkpointables.items()
+    }
+
+  def get_handlers_for_load(
       self, directory: path_types.Path, abstract_checkpointables: dict[str, Any]
-  ):
-    """Returns a mapping from checkpointable name to loadable handler."""
+  ) -> dict[str, handler_types.CheckpointableHandler]:
+    """Returns a mapping from checkpointable name to handler."""
     existing_checkpointable_names_to_handler_typestrs = (
         self._get_saved_handler_typestrs(directory)
     )
@@ -225,14 +265,13 @@ class CompositeHandler:
       if isinstance(saved_metadata.item_handlers, dict):
         return saved_metadata.item_handlers  # found step level metadata.
       raise ValueError(
-          'Expected a valid path containing checkpointable subdirectories, but'
-          ' given path contains subdirectories:'
-          f' {format_utils.subdirs(directory)}... Given path is {directory}.'
-          ' _CHECKPOINT_METADATA file under given path has'
-          f' `item_handlers`={saved_metadata.item_handlers}, whose keys should'
-          ' match the checkpointable subdirectory names. If you intended to'
-          ' load a pytree checkpoint from the given path, then please consider'
-          ' using `loading.load_pytree(..., checkpointable_name=None)` instead.'
+          f'Path at {directory} contains subdirectories:'
+          f' {format_utils.subdirs(directory)}, which are expected to match the'
+          ' keys given by the _CHECKPOINT_METADATA file:'
+          f' {saved_metadata.item_handlers}. If you intended to load a pytree'
+          ' checkpoint from the given path, then please consider using'
+          ' `loading.load_pytree(..., checkpointable_name=None)` instead.'
+          f' {_V0_ERROR_MESSAGE}'
       )
 
     logging.warning(
@@ -254,14 +293,13 @@ class CompositeHandler:
       )
       if isinstance(saved_metadata.item_handlers, dict):
         raise ValueError(
-            'Expected a valid path containing checkpointable subdirectories,'
-            ' but given path contains subdirectories:'
-            f' {format_utils.subdirs(directory)}... Given path is {directory}.'
-            ' _CHECKPOINT_METADATA file under a subdir of given path has'
-            f' `item_handlers`={saved_metadata.item_handlers}, whose keys'
-            ' should match the checkpointable subdirectory names. Did you mean'
-            ' to provide the following subdirectory path instead:'
-            f' {checkpointable_path}?'
+            f'Path at {directory} contains subdirectories:'
+            f' {format_utils.subdirs(directory)}, which are expected to match'
+            ' the keys given by the _CHECKPOINT_METADATA file:'
+            f' {saved_metadata.item_handlers}. If you intended to load a pytree'
+            ' checkpoint from the given path, then please consider using'
+            ' `loading.load_pytree(..., checkpointable_name=None)` instead.'
+            f' {_V0_ERROR_MESSAGE}'
         )
       item_handlers = saved_metadata.item_handlers
       if item_handlers is not None:

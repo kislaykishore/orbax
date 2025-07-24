@@ -30,6 +30,11 @@ def simple_subtract(params, inputs):
   return params - inputs
 
 
+@jax.jit
+def _linear(params, inputs):
+  return jnp.dot(inputs, params['w']) + params['b']
+
+
 class ObmModuleTest(parameterized.TestCase):
 
   def assertHasAttr(self, obj, attr_name):
@@ -38,6 +43,27 @@ class ObmModuleTest(parameterized.TestCase):
         msg=f'Object (of type {type(obj)}) does not have attribute {attr_name}',
     )
 
+  def test_init_raises_error_when_input_poly_shape_symbol_vals_provided(self):
+    # Test init raise error when `input_polymorphic_shape_symbol_values` is
+    # provided but there is no `input_polymorphic_shape`
+    with self.assertRaisesRegex(
+        ValueError,
+        r'`input_polymorphic_shape` is required when'
+        r' `input_polymorphic_shape_symbol_values` is provided.',
+    ):
+      obm_module.ObmModule(
+          params={
+              'w': jnp.ones((2, 2), dtype=jnp.float32),
+              'b': jnp.ones((2), dtype=jnp.float32),
+          },
+          apply_fn=_linear,
+          # For polymorphic shape, input polymorphic shape could be (b, 2)
+          # but set to None to test the error.
+          input_polymorphic_shape=None,
+          input_polymorphic_shape_symbol_values={'b': (1, 2)},
+          jax2obm_kwargs=None,
+      )
+
   @parameterized.named_parameters(
       dict(
           testcase_name='ok_model_pos_kwargs',
@@ -45,6 +71,7 @@ class ObmModuleTest(parameterized.TestCase):
               'simple_add': None,
               'simple_subtract': None,
           },
+          input_polymorphic_shape_symbol_values=None,
           jax2obm_kwargs={constants.CHECKPOINT_PATH: 'checkpoint_path'},
           apply_fn_map={
               'simple_add': simple_add,
@@ -60,6 +87,7 @@ class ObmModuleTest(parameterized.TestCase):
               'simple_add': None,
               'simple_subtract': None,
           },
+          input_polymorphic_shape_symbol_values=None,
           jax2obm_kwargs={
               constants.CHECKPOINT_PATH: 'checkpoint_path',
               constants.POLYMORPHIC_CONSTRAINTS: ('mod(batch, 2) == 0',),
@@ -78,6 +106,7 @@ class ObmModuleTest(parameterized.TestCase):
               'simple_add': None,
               'simple_subtract': None,
           },
+          input_polymorphic_shape_symbol_values=None,
           jax2obm_kwargs={
               constants.CHECKPOINT_PATH: 'checkpoint_path',
               constants.POLYMORPHIC_CONSTRAINTS: {
@@ -92,12 +121,11 @@ class ObmModuleTest(parameterized.TestCase):
           expected_error=None,
       ),
       dict(
-          testcase_name=(
-              'error_input_polymorphic_shape_not_matching_apply_fn_map'
-          ),
+          testcase_name='error_input_poly_shape_not_matching_apply_fn_map',
           input_polymorphic_shape={
               'simple_add': (1, 2),
           },
+          input_polymorphic_shape_symbol_values=None,
           jax2obm_kwargs={constants.CHECKPOINT_PATH: 'checkpoint_path'},
           apply_fn_map={
               'simple_add': simple_add,
@@ -106,14 +134,15 @@ class ObmModuleTest(parameterized.TestCase):
           expected_error=(
               ValueError,
               (
-                  r'The size of apply_fn_map:2 should be equal to the size of'
-                  r' input_polymorphic_shape_map:1.'
+                  r'The keys of `apply_fn` and `input_polymorphic_shape`'
+                  r' should be the same'
               ),
           ),
       ),
       dict(
-          testcase_name='error_input_polymorphic_shape_is_not_mapping',
+          testcase_name='error_input_poly_shape_is_not_mapping',
           input_polymorphic_shape=(1, 2),
+          input_polymorphic_shape_symbol_values=None,
           jax2obm_kwargs={constants.CHECKPOINT_PATH: 'checkpoint_path'},
           apply_fn_map={
               'simple_add': simple_add,
@@ -121,10 +150,7 @@ class ObmModuleTest(parameterized.TestCase):
           },
           expected_error=(
               TypeError,
-              (
-                  r'When apply_fn is a mapping, input_polymorphic_shape must'
-                  r' also be a mapping.'
-              ),
+              r'`input_polymorphic_shape` must be a mapping, but got',
           ),
       ),
       dict(
@@ -133,6 +159,7 @@ class ObmModuleTest(parameterized.TestCase):
               'simple_add': None,
               'simple_subtract': None,
           },
+          input_polymorphic_shape_symbol_values=None,
           jax2obm_kwargs={
               constants.CHECKPOINT_PATH: 'checkpoint_path',
               constants.POLYMORPHIC_CONSTRAINTS: {
@@ -159,6 +186,7 @@ class ObmModuleTest(parameterized.TestCase):
               'simple_add': None,
               'simple_subtract': None,
           },
+          input_polymorphic_shape_symbol_values=None,
           jax2obm_kwargs={
               constants.CHECKPOINT_PATH: 'checkpoint_path',
               constants.POLYMORPHIC_CONSTRAINTS: {
@@ -187,6 +215,7 @@ class ObmModuleTest(parameterized.TestCase):
               'simple_add': None,
               'simple_subtract': None,
           },
+          input_polymorphic_shape_symbol_values=None,
           jax2obm_kwargs={
               constants.CHECKPOINT_PATH: 'checkpoint_path',
               constants.POLYMORPHIC_CONSTRAINTS: 2,
@@ -203,10 +232,93 @@ class ObmModuleTest(parameterized.TestCase):
               ),
           ),
       ),
+      dict(
+          testcase_name='error_input_poly_shape_symbol_vals_not_mapping',
+          input_polymorphic_shape={
+              'simple_add': ('b, 1', 'b, 1'),
+              'simple_subtract': ('b, 1', 'b, 1'),
+          },
+          input_polymorphic_shape_symbol_values=(1, 2, 3),
+          jax2obm_kwargs={constants.CHECKPOINT_PATH: 'checkpoint_path'},
+          apply_fn_map={
+              'simple_add': simple_add,
+              'simple_subtract': simple_subtract,
+          },
+          expected_error=(
+              TypeError,
+              r'`input_polymorphic_shape_symbol_values` must be a mapping, but',
+          ),
+      ),
+      dict(
+          testcase_name='error_input_poly_shape_symbol_vals_map_key_mismatch',
+          input_polymorphic_shape={
+              'simple_add': ('b, 1', 'b, 1'),
+              'simple_subtract': ('b, 1', 'b, 1'),
+          },
+          input_polymorphic_shape_symbol_values={
+              'mismatch_simple_add': {
+                  'b': (1, 2),
+              },
+              'mismatch_simple_subtract': {
+                  'b': (1, 2),
+              },
+          },
+          jax2obm_kwargs={constants.CHECKPOINT_PATH: 'checkpoint_path'},
+          apply_fn_map={
+              'simple_add': simple_add,
+              'simple_subtract': simple_subtract,
+          },
+          expected_error=(
+              ValueError,
+              (
+                  r'The keys of `apply_fn` and'
+                  r' `input_polymorphic_shape_symbol_values` should be the same'
+              ),
+          ),
+      ),
+      dict(
+          testcase_name='error_apply_fn_is_empty_map',
+          input_polymorphic_shape={
+              'simple_add': None,
+              'simple_subtract': None,
+          },
+          input_polymorphic_shape_symbol_values=None,
+          jax2obm_kwargs={
+              constants.CHECKPOINT_PATH: 'checkpoint_path',
+              constants.POLYMORPHIC_CONSTRAINTS: 2,
+          },
+          apply_fn_map={},
+          expected_error=(
+              ValueError,
+              r'`apply_fn` should be a non-empty mapping',
+          ),
+      ),
+      dict(
+          testcase_name='error_input_poly_shape_key_not_matching_apply_fn_map',
+          input_polymorphic_shape={
+              'simple_subtract': None,
+          },
+          input_polymorphic_shape_symbol_values=None,
+          jax2obm_kwargs={
+              constants.CHECKPOINT_PATH: 'checkpoint_path',
+              constants.POLYMORPHIC_CONSTRAINTS: 2,
+          },
+          apply_fn_map={
+              'simple_add': simple_add,
+          },
+          expected_error=(
+              ValueError,
+              (
+                  r'The keys of `apply_fn` and `input_polymorphic_shape`'
+                  r' should be the same'
+              ),
+          ),
+      ),
   )
   def test_obm_module_multiple_apply_fns(
       self,
       input_polymorphic_shape,
+      input_polymorphic_shape_symbol_values,
       jax2obm_kwargs,
       apply_fn_map,
       expected_error,
@@ -220,6 +332,7 @@ class ObmModuleTest(parameterized.TestCase):
           params=params,
           apply_fn=apply_fn_map,
           input_polymorphic_shape=input_polymorphic_shape,
+          input_polymorphic_shape_symbol_values=input_polymorphic_shape_symbol_values,
           jax2obm_kwargs=jax2obm_kwargs,
       )
       expected_weights_name = constants.DEFAULT_WEIGHTS_NAME
@@ -240,6 +353,7 @@ class ObmModuleTest(parameterized.TestCase):
             params=params,
             apply_fn=apply_fn_map,
             input_polymorphic_shape=input_polymorphic_shape,
+            input_polymorphic_shape_symbol_values=input_polymorphic_shape_symbol_values,
             jax2obm_kwargs=jax2obm_kwargs,
         )
 

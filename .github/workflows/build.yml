@@ -56,7 +56,7 @@ jobs:
         elif [[ "${{ matrix.jax-version }}" == "nightly" ]]; then
           pip install -U --pre jax jaxlib --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax-public-nightly-artifacts-registry/simple/
         else
-          pip install "jax==${{ matrix.jax-version }}" "jaxlib==${{ matrix.jax-version }}"
+          pip install "jax>=${{ matrix.jax-version }}" "jaxlib>=${{ matrix.jax-version }}"
         fi
     - name: Test with pytest
     # TODO(yaning): Move these to an exclude target within pytest.ini.
@@ -107,6 +107,7 @@ jobs:
       uses: arduino/setup-protoc@v1
       with:
         version: '3.x'
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
     - name: Extract branch name
       shell: bash
       run: echo "branch=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_OUTPUT
@@ -179,6 +180,7 @@ jobs:
       uses: arduino/setup-protoc@v1
       with:
         version: '3.x'
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
     - name: Extract branch name
       shell: bash
       run: echo "branch=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_OUTPUT
